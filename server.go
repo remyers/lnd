@@ -328,6 +328,18 @@ func noiseDial(idKey keychain.SingleKeyECDH,
 	}
 }
 
+// noNoiseDial is a factory function which creates a connmgr compliant dialing
+// function by returning a closure which *does not* includes the server's identity key.
+func noNoiseDial(netCfg tor.Net) func(net.Addr) (net.Conn, error) {
+
+	return func(a net.Addr) (net.Conn, error) {
+		lnAddr := a.(*lnwire.NetAddress)
+		ipAddr := lnAddr.Address.String()
+		conn, err := net.Dial("tcp", ipAddr)
+		return conn, err
+	}
+}
+
 // newServer creates a new instance of the server which is to listen using the
 // passed listener address.
 func newServer(cfg *Config, listenAddrs []net.Addr,
@@ -1259,7 +1271,7 @@ func newServer(cfg *Config, listenAddrs []net.Addr,
 		OnAccept:       s.InboundPeerConnected,
 		RetryDuration:  time.Second * 5,
 		TargetOutbound: 100,
-		Dial:           noiseDial(s.identityECDH, s.cfg.net),
+		Dial:           noNoiseDial(s.cfg.net),
 		OnConnection:   s.OutboundPeerConnected,
 	})
 	if err != nil {
@@ -2643,6 +2655,7 @@ func (s *server) OutboundPeerConnected(connReq *connmgr.ConnReq, conn net.Conn) 
 		return
 	}
 
+	// TODO: can not do do this if normal net.Conn replaces brontide, right?
 	nodePub := conn.(*brontide.Conn).RemotePub()
 	pubStr := string(nodePub.SerializeCompressed())
 
@@ -3369,7 +3382,8 @@ func (s *server) ConnectToPeer(addr *lnwire.NetAddress, perm bool) error {
 // notify the caller if the connection attempt has failed. Otherwise, it will be
 // closed.
 func (s *server) connectToPeer(addr *lnwire.NetAddress, errChan chan<- error) {
-	conn, err := brontide.Dial(s.identityECDH, addr, s.cfg.net.Dial)
+	ipAddr := addr.Address.String()
+	conn, err := net.Dial("tcp", ipAddr)
 	if err != nil {
 		srvrLog.Errorf("Unable to connect to %v: %v", addr, err)
 		select {
