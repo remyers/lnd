@@ -55,7 +55,7 @@ const (
 	// each hop of the route, the first pair in cleartext and the following
 	// pairs increasingly obfuscated. If not all space is used up, the
 	// remainder is padded with null-bytes, also obfuscated.
-	routingInfoSize = 1300
+	routingInfoSize = 131
 
 	// numStreamBytes is the number of bytes produced by our CSPRG for the
 	// key stream implementing our stream cipher to encrypt/decrypt the mix

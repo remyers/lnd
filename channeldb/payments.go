@@ -947,7 +947,7 @@ func serializeHop(w io.Writer, h *route.Hop) error {
 
 // maxOnionPayloadSize is the largest Sphinx payload possible, so we don't need
 // to read/write a TLV stream larger than this.
-const maxOnionPayloadSize = 1300
+const maxOnionPayloadSize = 131
 
 func deserializeHop(r io.Reader) (*route.Hop, error) {
 	h := &route.Hop{}
