@@ -382,6 +382,9 @@ type Machine struct {
 	// out for a pending message. This allows us to tolerate timeout errors
 	// that cause partial writes.
 	nextBodySend []byte
+
+	// disable for testing
+	enableEncryption bool
 }
 
 // NewBrontideMachine creates a new instance of the brontide state-machine. If
@@ -407,6 +410,8 @@ func NewBrontideMachine(initiator bool, localKey keychain.SingleKeyECDH,
 	for _, option := range options {
 		option(m)
 	}
+
+	m.enableEncryption = false
 
 	return m
 }
@@ -742,6 +747,14 @@ func (b *Machine) WriteMessage(p []byte) error {
 	var pktLen [2]byte
 	binary.BigEndian.PutUint16(pktLen[:], fullLength)
 
+	if b.enableEncryption == false {
+		var mac = make([]byte, macSize)
+		b.nextHeaderSend = append(pktLen[:], mac...)
+		b.nextBodySend = append(p, mac...)
+
+		return nil
+	}
+
 	// First, generate the encrypted+MAC'd length prefix for the packet.
 	b.nextHeaderSend = b.sendCipher.Encrypt(nil, nil, pktLen[:])
 
@@ -848,9 +861,17 @@ func (b *Machine) ReadMessage(r io.Reader) ([]byte, error) {
 // appropriately, it is preferred that they use the split ReadHeader and
 // ReadBody methods so that the deadlines can be set appropriately on each.
 func (b *Machine) ReadHeader(r io.Reader) (uint32, error) {
+
 	_, err := io.ReadFull(r, b.nextCipherHeader[:])
 	if err != nil {
 		return 0, err
+	}
+
+	if b.enableEncryption == false {
+		// Compute the packet length that we will need to read off the wire.
+		pktLen := uint32(binary.BigEndian.Uint16(b.nextCipherHeader[:])) + macSize
+
+		return pktLen, nil
 	}
 
 	// Attempt to decrypt+auth the packet length present in the stream.
@@ -878,6 +899,12 @@ func (b *Machine) ReadBody(r io.Reader, buf []byte) ([]byte, error) {
 	_, err := io.ReadFull(r, buf)
 	if err != nil {
 		return nil, err
+	}
+
+	if b.enableEncryption == false {
+		var ret = make([]byte, len(buf)-16, len(buf))
+		copy(ret, buf)
+		return ret, nil
 	}
 
 	// Finally, decrypt the message held in the buffer, and return a
