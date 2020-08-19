@@ -3,11 +3,17 @@
 mkdir -p build
 
 # Check falafel version.
-falafelVersion="0.5"
+falafelVersion=$1
+if [ -z $falafelVersion ]
+then
+        echo "falafel version not set"
+        exit 1
+fi
+
 falafel=$(which falafel)
 if [ $falafel ]
 then
-        version=$($falafel -v)
+        version="v$($falafel -v)"
         if [ $version != $falafelVersion ]
         then
                 echo "falafel version $falafelVersion required"
@@ -19,23 +25,40 @@ else
         exit 1
 fi
 
+# Name of the package for the generated APIs.
 pkg="lndmobile"
+
+# The package where the protobuf definitions originally are found.
 target_pkg="github.com/lightningnetwork/lnd/lnrpc"
 
-# Generate APIs by passing the parsed protos to the falafel plugin.
-opts="package_name=$pkg,target_package=$target_pkg,listeners=lightning=lightningLis walletunlocker=walletUnlockerLis,mem_rpc=1"
-protoc -I/usr/local/include -I. \
-       -I$GOPATH/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis \
-       --plugin=protoc-gen-custom=$falafel\
-       --custom_out=./build \
-       --custom_opt="$opts" \
-       --proto_path=../lnrpc \
-       rpc.proto
+# A mapping from grpc service to name of the custom listeners. The grpc server
+# must be configured to listen on these.
+listeners="lightning=lightningLis walletunlocker=walletUnlockerLis"
+
+# Set to 1 to create boiler plate grpc client code and listeners. If more than
+# one proto file is being parsed, it should only be done once.
+mem_rpc=1
+
+PROTOS="rpc.proto walletunlocker.proto"
+
+opts="package_name=$pkg,target_package=$target_pkg,listeners=$listeners,mem_rpc=$mem_rpc"
+
+for file in $PROTOS; do
+  echo "Generating mobile protos from ${file}"
+
+  protoc -I/usr/local/include -I. \
+         -I$GOPATH/src/github.com/grpc-ecosystem/grpc-gateway/third_party/googleapis \
+         --plugin=protoc-gen-custom=$falafel\
+         --custom_out=./build \
+         --custom_opt="$opts" \
+         --proto_path=../lnrpc \
+         "${file}"
+done
 
 # If prefix=1 is specified, prefix the generated methods with subserver name.
 # This must be enabled to support subservers with name conflicts.
 use_prefix="0"
-if [[ $prefix = "1" ]]
+if [ "$prefix" = "1" ]
 then
     echo "Prefixing methods with subserver name"
     use_prefix="1"
@@ -62,3 +85,6 @@ do
            --proto_path=${DIRECTORY} \
            ${file}
 done
+
+# Run goimports to resolve any dependencies among the sub-servers.
+goimports -w ./*_generated.go

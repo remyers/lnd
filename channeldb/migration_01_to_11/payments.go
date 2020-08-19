@@ -11,10 +11,9 @@ import (
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/coreos/bbolt"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/routing/route"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
@@ -213,7 +212,7 @@ type PaymentAttemptInfo struct {
 	SessionKey *btcec.PrivateKey
 
 	// Route is the route attempted to send the HTLC.
-	Route route.Route
+	Route Route
 }
 
 // Payment is a wrapper around a payment's PaymentCreationInfo,
@@ -255,14 +254,14 @@ type Payment struct {
 func (db *DB) FetchPayments() ([]*Payment, error) {
 	var payments []*Payment
 
-	err := db.View(func(tx *bbolt.Tx) error {
-		paymentsBucket := tx.Bucket(paymentsRootBucket)
+	err := kvdb.View(db, func(tx kvdb.RTx) error {
+		paymentsBucket := tx.ReadBucket(paymentsRootBucket)
 		if paymentsBucket == nil {
 			return nil
 		}
 
 		return paymentsBucket.ForEach(func(k, v []byte) error {
-			bucket := paymentsBucket.Bucket(k)
+			bucket := paymentsBucket.NestedReadBucket(k)
 			if bucket == nil {
 				// We only expect sub-buckets to be found in
 				// this top-level bucket.
@@ -281,13 +280,13 @@ func (db *DB) FetchPayments() ([]*Payment, error) {
 			// payment has was possible. These will be found in a
 			// sub-bucket indexed by their sequence number if
 			// available.
-			dup := bucket.Bucket(paymentDuplicateBucket)
+			dup := bucket.NestedReadBucket(paymentDuplicateBucket)
 			if dup == nil {
 				return nil
 			}
 
 			return dup.ForEach(func(k, v []byte) error {
-				subBucket := dup.Bucket(k)
+				subBucket := dup.NestedReadBucket(k)
 				if subBucket == nil {
 					// We one bucket for each duplicate to
 					// be found.
@@ -317,7 +316,7 @@ func (db *DB) FetchPayments() ([]*Payment, error) {
 	return payments, nil
 }
 
-func fetchPayment(bucket *bbolt.Bucket) (*Payment, error) {
+func fetchPayment(bucket kvdb.RBucket) (*Payment, error) {
 	var (
 		err error
 		p   = &Payment{}
@@ -464,7 +463,7 @@ func deserializePaymentAttemptInfo(r io.Reader) (*PaymentAttemptInfo, error) {
 	return a, nil
 }
 
-func serializeHop(w io.Writer, h *route.Hop) error {
+func serializeHop(w io.Writer, h *Hop) error {
 	if err := WriteElements(w,
 		h.PubKeyBytes[:], h.ChannelID, h.OutgoingTimeLock,
 		h.AmtToForward,
@@ -513,8 +512,8 @@ func serializeHop(w io.Writer, h *route.Hop) error {
 // to read/write a TLV stream larger than this.
 const maxOnionPayloadSize = 1300
 
-func deserializeHop(r io.Reader) (*route.Hop, error) {
-	h := &route.Hop{}
+func deserializeHop(r io.Reader) (*Hop, error) {
+	h := &Hop{}
 
 	var pub []byte
 	if err := ReadElements(r, &pub); err != nil {
@@ -562,18 +561,13 @@ func deserializeHop(r io.Reader) (*route.Hop, error) {
 		tlvMap[tlvType] = rawRecordBytes
 	}
 
-	tlvRecords, err := tlv.MapToRecords(tlvMap)
-	if err != nil {
-		return nil, err
-	}
-
-	h.TLVRecords = tlvRecords
+	h.TLVRecords = tlv.MapToRecords(tlvMap)
 
 	return h, nil
 }
 
 // SerializeRoute serializes a route.
-func SerializeRoute(w io.Writer, r route.Route) error {
+func SerializeRoute(w io.Writer, r Route) error {
 	if err := WriteElements(w,
 		r.TotalTimeLock, r.TotalAmount, r.SourcePubKey[:],
 	); err != nil {
@@ -594,8 +588,8 @@ func SerializeRoute(w io.Writer, r route.Route) error {
 }
 
 // DeserializeRoute deserializes a route.
-func DeserializeRoute(r io.Reader) (route.Route, error) {
-	rt := route.Route{}
+func DeserializeRoute(r io.Reader) (Route, error) {
+	rt := Route{}
 	if err := ReadElements(r,
 		&rt.TotalTimeLock, &rt.TotalAmount,
 	); err != nil {
@@ -613,7 +607,7 @@ func DeserializeRoute(r io.Reader) (route.Route, error) {
 		return rt, err
 	}
 
-	var hops []*route.Hop
+	var hops []*Hop
 	for i := uint32(0); i < numHops; i++ {
 		hop, err := deserializeHop(r)
 		if err != nil {

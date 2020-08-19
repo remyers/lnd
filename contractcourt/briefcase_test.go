@@ -14,9 +14,9 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/coreos/bbolt"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/lnwallet"
 )
@@ -44,6 +44,15 @@ var (
 			0x2d, 0xe7, 0x93, 0xe4,
 		},
 		Index: 2,
+	}
+
+	testChanPoint3 = wire.OutPoint{
+		Hash: chainhash.Hash{
+			0x48, 0x59, 0xe6, 0x96, 0x31, 0x13, 0xa1, 0x17,
+			0x51, 0xb6, 0x37, 0xd8, 0xfc, 0xd2, 0xc6, 0xda,
+			0x2d, 0xe7, 0x93, 0xe4,
+		},
+		Index: 3,
 	}
 
 	testPreimage = [32]byte{
@@ -95,7 +104,7 @@ var (
 	}
 )
 
-func makeTestDB() (*bbolt.DB, func(), error) {
+func makeTestDB() (kvdb.Backend, func(), error) {
 	// First, create a temporary directory to be used for the duration of
 	// this test.
 	tempDirName, err := ioutil.TempDir("", "arblog")
@@ -103,7 +112,7 @@ func makeTestDB() (*bbolt.DB, func(), error) {
 		return nil, nil, err
 	}
 
-	db, err := bbolt.Open(tempDirName+"/test.db", 0600, nil)
+	db, err := kvdb.Create(kvdb.BoltBackendName, tempDirName+"/test.db", true)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -124,7 +133,12 @@ func newTestBoltArbLog(chainhash chainhash.Hash,
 		return nil, nil, err
 	}
 
-	testArbCfg := ChannelArbitratorConfig{}
+	testArbCfg := ChannelArbitratorConfig{
+		PutResolverReport: func(_ kvdb.RwTx,
+			_ *channeldb.ResolverReport) error {
+			return nil
+		},
+	}
 	testLog, err := newBoltArbitratorLog(testDB, testArbCfg, chainhash, op)
 	if err != nil {
 		return nil, nil, err
@@ -324,8 +338,10 @@ func TestContractInsertionRetrieval(t *testing.T) {
 	resolverMap[string(resolvers[3].ResolverKey())] = resolvers[3]
 	resolverMap[string(resolvers[4].ResolverKey())] = resolvers[4]
 
-	// Now, we'll insert the resolver into the log.
-	if err := testLog.InsertUnresolvedContracts(resolvers...); err != nil {
+	// Now, we'll insert the resolver into the log, we do not need to apply
+	// any closures, so we will pass in nil.
+	err = testLog.InsertUnresolvedContracts(nil, resolvers...)
+	if err != nil {
 		t.Fatalf("unable to insert resolvers: %v", err)
 	}
 
@@ -405,8 +421,9 @@ func TestContractResolution(t *testing.T) {
 	}
 
 	// First, we'll insert the resolver into the database and ensure that
-	// we get the same resolver out the other side.
-	err = testLog.InsertUnresolvedContracts(timeoutResolver)
+	// we get the same resolver out the other side. We do not need to apply
+	// any closures.
+	err = testLog.InsertUnresolvedContracts(nil, timeoutResolver)
 	if err != nil {
 		t.Fatalf("unable to insert contract into db: %v", err)
 	}
@@ -468,8 +485,9 @@ func TestContractSwapping(t *testing.T) {
 		htlcTimeoutResolver: timeoutResolver,
 	}
 
-	// We'll first insert the contest resolver into the log.
-	err = testLog.InsertUnresolvedContracts(contestResolver)
+	// We'll first insert the contest resolver into the log with no
+	// additional updates.
+	err = testLog.InsertUnresolvedContracts(nil, contestResolver)
 	if err != nil {
 		t.Fatalf("unable to insert contract into db: %v", err)
 	}
@@ -539,6 +557,10 @@ func TestContractResolutionsStorage(t *testing.T) {
 					SweepSignDesc:   testSignDesc,
 				},
 			},
+		},
+		AnchorResolution: &lnwallet.AnchorResolution{
+			CommitAnchor:         testChanPoint3,
+			AnchorSignDescriptor: testSignDesc,
 		},
 	}
 

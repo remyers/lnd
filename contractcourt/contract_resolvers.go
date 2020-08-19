@@ -3,9 +3,12 @@ package contractcourt
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/btcsuite/btcd/wire"
+	"github.com/btcsuite/btclog"
+	"github.com/lightningnetwork/lnd/build"
 	"github.com/lightningnetwork/lnd/channeldb"
 )
 
@@ -83,8 +86,10 @@ type ResolverConfig struct {
 
 	// Checkpoint allows a resolver to check point its state. This function
 	// should write the state of the resolver to persistent storage, and
-	// return a non-nil error upon success.
-	Checkpoint func(ContractResolver) error
+	// return a non-nil error upon success. It takes a resolver report,
+	// which contains information about the outcome and should be written
+	// to disk if non-nil.
+	Checkpoint func(ContractResolver, ...*channeldb.ResolverReport) error
 }
 
 // contractResolverKit is meant to be used as a mix-in struct to be embedded within a
@@ -92,6 +97,8 @@ type ResolverConfig struct {
 // a resolver requires to carry out its duties.
 type contractResolverKit struct {
 	ResolverConfig
+
+	log btclog.Logger
 
 	quit chan struct{}
 }
@@ -102,6 +109,12 @@ func newContractResolverKit(cfg ResolverConfig) *contractResolverKit {
 		ResolverConfig: cfg,
 		quit:           make(chan struct{}),
 	}
+}
+
+// initLogger initializes the resolver-specific logger.
+func (r *contractResolverKit) initLogger(resolver ContractResolver) {
+	logPrefix := fmt.Sprintf("%T(%v):", resolver, r.ChanPoint)
+	r.log = build.NewPrefixLog(logPrefix, log)
 }
 
 var (

@@ -34,7 +34,7 @@ func getInvoicesClient(ctx *cli.Context) (invoicesrpc.InvoicesClient, func()) {
 
 var settleInvoiceCommand = cli.Command{
 	Name:     "settleinvoice",
-	Category: "Payments",
+	Category: "Invoices",
 	Usage:    "Reveal a preimage and use it to settle the corresponding invoice.",
 	Description: `
 	Todo.`,
@@ -81,14 +81,14 @@ func settleInvoice(ctx *cli.Context) error {
 		return err
 	}
 
-	printJSON(resp)
+	printRespJSON(resp)
 
 	return nil
 }
 
 var cancelInvoiceCommand = cli.Command{
 	Name:     "cancelinvoice",
-	Category: "Payments",
+	Category: "Invoices",
 	Usage:    "Cancels a (hold) invoice",
 	Description: `
 	Todo.`,
@@ -134,14 +134,14 @@ func cancelInvoice(ctx *cli.Context) error {
 		return err
 	}
 
-	printJSON(resp)
+	printRespJSON(resp)
 
 	return nil
 }
 
 var addHoldInvoiceCommand = cli.Command{
 	Name:     "addholdinvoice",
-	Category: "Payments",
+	Category: "Invoices",
 	Usage:    "Add a new hold invoice.",
 	Description: `
 	Add a new invoice, expressing intent for a future payment.
@@ -159,6 +159,10 @@ var addHoldInvoiceCommand = cli.Command{
 		cli.Int64Flag{
 			Name:  "amt",
 			Usage: "the amt of satoshis in this invoice",
+		},
+		cli.Int64Flag{
+			Name:  "amt_msat",
+			Usage: "the amt of millisatoshis in this invoice",
 		},
 		cli.StringFlag{
 			Name: "description_hash",
@@ -192,7 +196,6 @@ var addHoldInvoiceCommand = cli.Command{
 func addHoldInvoice(ctx *cli.Context) error {
 	var (
 		descHash []byte
-		amt      int64
 		err      error
 	)
 
@@ -212,12 +215,11 @@ func addHoldInvoice(ctx *cli.Context) error {
 
 	args = args.Tail()
 
-	switch {
-	case ctx.IsSet("amt"):
-		amt = ctx.Int64("amt")
-	case args.Present():
-		amt, err = strconv.ParseInt(args.First(), 10, 64)
+	amt := ctx.Int64("amt")
+	amtMsat := ctx.Int64("amt_msat")
 
+	if !ctx.IsSet("amt") && !ctx.IsSet("amt_msat") && args.Present() {
+		amt, err = strconv.ParseInt(args.First(), 10, 64)
 		if err != nil {
 			return fmt.Errorf("unable to decode amt argument: %v", err)
 		}
@@ -236,6 +238,7 @@ func addHoldInvoice(ctx *cli.Context) error {
 		Memo:            ctx.String("memo"),
 		Hash:            hash,
 		Value:           amt,
+		ValueMsat:       amtMsat,
 		DescriptionHash: descHash,
 		FallbackAddr:    ctx.String("fallback_addr"),
 		Expiry:          ctx.Int64("expiry"),

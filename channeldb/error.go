@@ -10,6 +10,11 @@ var (
 	// created.
 	ErrNoChanDBExists = fmt.Errorf("channel db has not yet been created")
 
+	// ErrNoHistoricalBucket is returned when the historical channel bucket
+	// not been created yet.
+	ErrNoHistoricalBucket = fmt.Errorf("historical channel bucket has " +
+		"not yet been created")
+
 	// ErrDBReversion is returned when detecting an attempt to revert to a
 	// prior database version.
 	ErrDBReversion = fmt.Errorf("channel db cannot revert to prior version")
@@ -37,6 +42,14 @@ var (
 	// ErrDuplicateInvoice is returned when an invoice with the target
 	// payment hash already exists.
 	ErrDuplicateInvoice = fmt.Errorf("invoice with payment hash already exists")
+
+	// ErrDuplicatePayAddr is returned when an invoice with the target
+	// payment addr already exists.
+	ErrDuplicatePayAddr = fmt.Errorf("invoice with payemnt addr already exists")
+
+	// ErrInvRefEquivocation is returned when an InvoiceRef targets
+	// multiple, distinct invoices.
+	ErrInvRefEquivocation = errors.New("inv ref matches multiple invoices")
 
 	// ErrNoPaymentsCreated is returned when bucket of payments hasn't been
 	// created.

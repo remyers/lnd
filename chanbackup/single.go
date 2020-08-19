@@ -31,6 +31,11 @@ const (
 	// implicitly denotes that this channel uses the new tweakless commit
 	// format.
 	TweaklessCommitVersion = 1
+
+	// AnchorsCommitVersion is the third SCB version. This version
+	// implicitly denotes that this channel uses the new anchor commitment
+	// format.
+	AnchorsCommitVersion = 2
 )
 
 // Single is a static description of an existing channel that can be used for
@@ -66,6 +71,9 @@ type Single struct {
 	// ShortChannelID encodes the exact location in the chain in which the
 	// channel was initially confirmed. This includes: the block height,
 	// transaction index, and the output within the target transaction.
+	// Channels that were not confirmed at the time of backup creation will
+	// have the funding TX broadcast height set as their block height in
+	// the ShortChannelID.
 	ShortChannelID lnwire.ShortChannelID
 
 	// RemoteNodePub is the identity public key of the remote node this
@@ -126,11 +134,21 @@ func NewSingle(channel *channeldb.OpenChannel,
 	// key.
 	_, shaChainPoint := btcec.PrivKeyFromBytes(btcec.S256(), b.Bytes())
 
+	// If a channel is unconfirmed, the block height of the ShortChannelID
+	// is zero. This will lead to problems when trying to restore that
+	// channel as the spend notifier would get a height hint of zero.
+	// To work around that problem, we add the channel broadcast height
+	// to the channel ID so we can use that as height hint on restore.
+	chanID := channel.ShortChanID()
+	if chanID.BlockHeight == 0 {
+		chanID.BlockHeight = channel.FundingBroadcastHeight
+	}
+
 	single := Single{
 		IsInitiator:     channel.IsInitiator,
 		ChainHash:       channel.ChainHash,
 		FundingOutpoint: channel.FundingOutpoint,
-		ShortChannelID:  channel.ShortChannelID,
+		ShortChannelID:  chanID,
 		RemoteNodePub:   channel.IdentityPub,
 		Addresses:       nodeAddrs,
 		Capacity:        channel.Capacity,
@@ -144,9 +162,14 @@ func NewSingle(channel *channeldb.OpenChannel,
 		},
 	}
 
-	if channel.ChanType.IsTweakless() {
+	switch {
+	case channel.ChanType.HasAnchors():
+		single.Version = AnchorsCommitVersion
+
+	case channel.ChanType.IsTweakless():
 		single.Version = TweaklessCommitVersion
-	} else {
+
+	default:
 		single.Version = DefaultSingleVersion
 	}
 
@@ -161,6 +184,7 @@ func (s *Single) Serialize(w io.Writer) error {
 	switch s.Version {
 	case DefaultSingleVersion:
 	case TweaklessCommitVersion:
+	case AnchorsCommitVersion:
 	default:
 		return fmt.Errorf("unable to serialize w/ unknown "+
 			"version: %v", s.Version)
@@ -319,6 +343,7 @@ func (s *Single) Deserialize(r io.Reader) error {
 	switch s.Version {
 	case DefaultSingleVersion:
 	case TweaklessCommitVersion:
+	case AnchorsCommitVersion:
 	default:
 		return fmt.Errorf("unable to de-serialize w/ unknown "+
 			"version: %v", s.Version)

@@ -11,12 +11,11 @@ import (
 	"time"
 
 	"github.com/btcsuite/btcutil"
-	"github.com/coreos/bbolt"
 	"github.com/davecgh/go-spew/spew"
 	"github.com/go-errors/errors"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/routing/route"
 )
 
 // TestPaymentStatusesMigration checks that already completed payments will have
@@ -60,8 +59,8 @@ func TestPaymentStatusesMigration(t *testing.T) {
 		// locally-sourced payment should end up with an InFlight
 		// status, while the other should remain unchanged, which
 		// defaults to Grounded.
-		err = d.Update(func(tx *bbolt.Tx) error {
-			circuits, err := tx.CreateBucketIfNotExists(
+		err = kvdb.Update(d, func(tx kvdb.RwTx) error {
+			circuits, err := tx.CreateTopLevelBucket(
 				[]byte("circuit-adds"),
 			)
 			if err != nil {
@@ -378,8 +377,8 @@ func TestMigrateOptionalChannelCloseSummaryFields(t *testing.T) {
 			// Get the old serialization format for this test's
 			// close summary, and it to the closed channel bucket.
 			old := test.oldSerialization(test.closeSummary)
-			err = d.Update(func(tx *bbolt.Tx) error {
-				closedChanBucket, err := tx.CreateBucketIfNotExists(
+			err = kvdb.Update(d, func(tx kvdb.RwTx) error {
+				closedChanBucket, err := tx.CreateTopLevelBucket(
 					closedChannelBucket,
 				)
 				if err != nil {
@@ -405,8 +404,8 @@ func TestMigrateOptionalChannelCloseSummaryFields(t *testing.T) {
 			newSerialization := b.Bytes()
 
 			var dbSummary []byte
-			err = d.View(func(tx *bbolt.Tx) error {
-				closedChanBucket := tx.Bucket(closedChannelBucket)
+			err = kvdb.View(d, func(tx kvdb.RTx) error {
+				closedChanBucket := tx.ReadBucket(closedChannelBucket)
 				if closedChanBucket == nil {
 					return errors.New("unable to find bucket")
 				}
@@ -483,8 +482,8 @@ func TestMigrateGossipMessageStoreKeys(t *testing.T) {
 			t.Fatalf("unable to serialize message: %v", err)
 		}
 
-		err := db.Update(func(tx *bbolt.Tx) error {
-			messageStore, err := tx.CreateBucketIfNotExists(
+		err := kvdb.Update(db, func(tx kvdb.RwTx) error {
+			messageStore, err := tx.CreateTopLevelBucket(
 				messageStoreBucket,
 			)
 			if err != nil {
@@ -504,8 +503,8 @@ func TestMigrateGossipMessageStoreKeys(t *testing.T) {
 	//   3. The message matches the original.
 	afterMigration := func(db *DB) {
 		var rawMsg []byte
-		err := db.View(func(tx *bbolt.Tx) error {
-			messageStore := tx.Bucket(messageStoreBucket)
+		err := kvdb.View(db, func(tx kvdb.RTx) error {
+			messageStore := tx.ReadBucket(messageStoreBucket)
 			if messageStore == nil {
 				return errors.New("message store bucket not " +
 					"found")
@@ -667,8 +666,8 @@ func TestOutgoingPaymentsMigration(t *testing.T) {
 
 		// Finally, check that the payment sequence number is updated
 		// to reflect the migrated payments.
-		err = d.View(func(tx *bbolt.Tx) error {
-			payments := tx.Bucket(paymentsRootBucket)
+		err = kvdb.Update(d, func(tx kvdb.RwTx) error {
+			payments := tx.ReadWriteBucket(paymentsRootBucket)
 			if payments == nil {
 				return fmt.Errorf("payments bucket not found")
 			}
@@ -714,25 +713,25 @@ func makeRandPaymentCreationInfo() (*PaymentCreationInfo, error) {
 func TestPaymentRouteSerialization(t *testing.T) {
 	t.Parallel()
 
-	legacyHop1 := &route.Hop{
-		PubKeyBytes:      route.NewVertex(pub),
+	legacyHop1 := &Hop{
+		PubKeyBytes:      NewVertex(pub),
 		ChannelID:        12345,
 		OutgoingTimeLock: 111,
 		LegacyPayload:    true,
 		AmtToForward:     555,
 	}
-	legacyHop2 := &route.Hop{
-		PubKeyBytes:      route.NewVertex(pub),
+	legacyHop2 := &Hop{
+		PubKeyBytes:      NewVertex(pub),
 		ChannelID:        12345,
 		OutgoingTimeLock: 111,
 		LegacyPayload:    true,
 		AmtToForward:     555,
 	}
-	legacyRoute := route.Route{
+	legacyRoute := Route{
 		TotalTimeLock: 123,
 		TotalAmount:   1234567,
-		SourcePubKey:  route.NewVertex(pub),
-		Hops:          []*route.Hop{legacyHop1, legacyHop2},
+		SourcePubKey:  NewVertex(pub),
+		Hops:          []*Hop{legacyHop1, legacyHop2},
 	}
 
 	const numPayments = 4
@@ -747,8 +746,8 @@ func TestPaymentRouteSerialization(t *testing.T) {
 	// We'll first add a series of fake payments, using the existing legacy
 	// serialization format.
 	beforeMigrationFunc := func(d *DB) {
-		err := d.Update(func(tx *bbolt.Tx) error {
-			paymentsBucket, err := tx.CreateBucket(
+		err := kvdb.Update(d, func(tx kvdb.RwTx) error {
+			paymentsBucket, err := tx.CreateTopLevelBucket(
 				paymentsRootBucket,
 			)
 			if err != nil {
@@ -799,7 +798,7 @@ func TestPaymentRouteSerialization(t *testing.T) {
 				// the proper bucket. If this is the duplicate
 				// payment, then we'll grab the dup bucket,
 				// otherwise, we'll use the top level bucket.
-				var payHashBucket *bbolt.Bucket
+				var payHashBucket kvdb.RwBucket
 				if i < numPayments-1 {
 					payHashBucket, err = paymentsBucket.CreateBucket(
 						payInfo.PaymentHash[:],
@@ -808,7 +807,7 @@ func TestPaymentRouteSerialization(t *testing.T) {
 						t.Fatalf("unable to create payments bucket: %v", err)
 					}
 				} else {
-					payHashBucket = paymentsBucket.Bucket(
+					payHashBucket = paymentsBucket.NestedReadWriteBucket(
 						payInfo.PaymentHash[:],
 					)
 					dupPayBucket, err := payHashBucket.CreateBucket(

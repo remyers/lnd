@@ -1,7 +1,6 @@
 package lnwallet
 
 import (
-	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
@@ -81,6 +80,19 @@ var (
 		},
 		LockTime: 5,
 	}
+
+	// A valid, DER-encoded signature (taken from btcec unit tests).
+	testSigBytes = []byte{
+		0x30, 0x44, 0x02, 0x20, 0x4e, 0x45, 0xe1, 0x69,
+		0x32, 0xb8, 0xaf, 0x51, 0x49, 0x61, 0xa1, 0xd3,
+		0xa1, 0xa2, 0x5f, 0xdf, 0x3f, 0x4f, 0x77, 0x32,
+		0xe9, 0xd6, 0x24, 0xc6, 0xc6, 0x15, 0x48, 0xab,
+		0x5f, 0xb8, 0xcd, 0x41, 0x02, 0x20, 0x18, 0x15,
+		0x22, 0xec, 0x8e, 0xca, 0x07, 0xde, 0x48, 0x60,
+		0xa4, 0xac, 0xdd, 0x12, 0x90, 0x9d, 0x83, 0x1c,
+		0xc5, 0x6c, 0xbb, 0xac, 0x46, 0x22, 0x08, 0x22,
+		0x21, 0xa8, 0x76, 0x8d, 0x1d, 0x09,
+	}
 )
 
 // CreateTestChannels creates to fully populated channels to be used within
@@ -91,7 +103,7 @@ var (
 // the test has been finalized. The clean up function will remote all temporary
 // files created. If tweaklessCommits is true, then the commits within the
 // channels will use the new format, otherwise the legacy format.
-func CreateTestChannels(tweaklessCommits bool) (
+func CreateTestChannels(chanType channeldb.ChannelType) (
 	*LightningChannel, *LightningChannel, func(), error) {
 
 	channelCapacity, err := btcutil.NewAmount(10)
@@ -208,7 +220,7 @@ func CreateTestChannels(tweaklessCommits bool) (
 
 	aliceCommitTx, bobCommitTx, err := CreateCommitmentTxns(
 		channelBal, channelBal, &aliceCfg, &bobCfg, aliceCommitPoint,
-		bobCommitPoint, *fundingTxIn, tweaklessCommits,
+		bobCommitPoint, *fundingTxIn, chanType,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -239,25 +251,34 @@ func CreateTestChannels(tweaklessCommits bool) (
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	commitFee := calcStaticFee(0)
+	commitFee := calcStaticFee(chanType, 0)
+	var anchorAmt btcutil.Amount
+	if chanType.HasAnchors() {
+		anchorAmt += 2 * anchorSize
+	}
+
+	aliceBalance := lnwire.NewMSatFromSatoshis(
+		channelBal - commitFee - anchorAmt,
+	)
+	bobBalance := lnwire.NewMSatFromSatoshis(channelBal)
 
 	aliceCommit := channeldb.ChannelCommitment{
 		CommitHeight:  0,
-		LocalBalance:  lnwire.NewMSatFromSatoshis(channelBal - commitFee),
-		RemoteBalance: lnwire.NewMSatFromSatoshis(channelBal),
+		LocalBalance:  aliceBalance,
+		RemoteBalance: bobBalance,
 		CommitFee:     commitFee,
 		FeePerKw:      btcutil.Amount(feePerKw),
 		CommitTx:      aliceCommitTx,
-		CommitSig:     bytes.Repeat([]byte{1}, 71),
+		CommitSig:     testSigBytes,
 	}
 	bobCommit := channeldb.ChannelCommitment{
 		CommitHeight:  0,
-		LocalBalance:  lnwire.NewMSatFromSatoshis(channelBal),
-		RemoteBalance: lnwire.NewMSatFromSatoshis(channelBal - commitFee),
+		LocalBalance:  bobBalance,
+		RemoteBalance: aliceBalance,
 		CommitFee:     commitFee,
 		FeePerKw:      btcutil.Amount(feePerKw),
 		CommitTx:      bobCommitTx,
-		CommitSig:     bytes.Repeat([]byte{1}, 71),
+		CommitSig:     testSigBytes,
 	}
 
 	var chanIDBytes [8]byte
@@ -275,7 +296,7 @@ func CreateTestChannels(tweaklessCommits bool) (
 		IdentityPub:             aliceKeys[0].PubKey(),
 		FundingOutpoint:         *prevOut,
 		ShortChannelID:          shortChanID,
-		ChanType:                channeldb.SingleFunderTweaklessBit,
+		ChanType:                chanType,
 		IsInitiator:             true,
 		Capacity:                channelCapacity,
 		RemoteCurrentRevocation: bobCommitPoint,
@@ -293,7 +314,7 @@ func CreateTestChannels(tweaklessCommits bool) (
 		IdentityPub:             bobKeys[0].PubKey(),
 		FundingOutpoint:         *prevOut,
 		ShortChannelID:          shortChanID,
-		ChanType:                channeldb.SingleFunderTweaklessBit,
+		ChanType:                chanType,
 		IsInitiator:             false,
 		Capacity:                channelCapacity,
 		RemoteCurrentRevocation: aliceCommitPoint,
@@ -303,11 +324,6 @@ func CreateTestChannels(tweaklessCommits bool) (
 		RemoteCommitment:        bobCommit,
 		Db:                      dbBob,
 		Packager:                channeldb.NewChannelPackager(shortChanID),
-	}
-
-	if !tweaklessCommits {
-		aliceChannelState.ChanType = channeldb.SingleFunderBit
-		bobChannelState.ChanType = channeldb.SingleFunderBit
 	}
 
 	aliceSigner := &input.MockSigner{Privkeys: aliceKeys}
@@ -324,6 +340,8 @@ func CreateTestChannels(tweaklessCommits bool) (
 	}
 	alicePool.Start()
 
+	obfuscator := createStateHintObfuscator(aliceChannelState)
+
 	bobPool := NewSigPool(1, bobSigner)
 	channelBob, err := NewLightningChannel(
 		bobSigner, bobChannelState, bobPool,
@@ -334,13 +352,13 @@ func CreateTestChannels(tweaklessCommits bool) (
 	bobPool.Start()
 
 	err = SetStateNumHint(
-		aliceCommitTx, 0, channelAlice.stateHintObfuscator,
+		aliceCommitTx, 0, obfuscator,
 	)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	err = SetStateNumHint(
-		bobCommitTx, 0, channelAlice.stateHintObfuscator,
+		bobCommitTx, 0, obfuscator,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -447,14 +465,14 @@ func txFromHex(txHex string) (*btcutil.Tx, error) {
 // calculations into account.
 //
 // TODO(bvu): Refactor when dynamic fee estimation is added.
-func calcStaticFee(numHTLCs int) btcutil.Amount {
+func calcStaticFee(chanType channeldb.ChannelType, numHTLCs int) btcutil.Amount {
 	const (
-		commitWeight = btcutil.Amount(724)
-		htlcWeight   = 172
-		feePerKw     = btcutil.Amount(24/4) * 1000
+		htlcWeight = 172
+		feePerKw   = btcutil.Amount(24/4) * 1000
 	)
-	return feePerKw * (commitWeight +
-		btcutil.Amount(htlcWeight*numHTLCs)) / 1000
+	return feePerKw *
+		(btcutil.Amount(CommitWeight(chanType) +
+			htlcWeight*int64(numHTLCs))) / 1000
 }
 
 // ForceStateTransition executes the necessary interaction between the two

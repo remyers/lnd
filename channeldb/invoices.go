@@ -8,17 +8,24 @@ import (
 	"io"
 	"time"
 
-	"github.com/btcsuite/btcd/wire"
-	"github.com/coreos/bbolt"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
+	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/record"
 	"github.com/lightningnetwork/lnd/tlv"
 )
 
 var (
-	// UnknownPreimage is an all-zeroes preimage that indicates that the
+	// unknownPreimage is an all-zeroes preimage that indicates that the
 	// preimage for this invoice is not yet known.
-	UnknownPreimage lntypes.Preimage
+	unknownPreimage lntypes.Preimage
+
+	// BlankPayAddr is a sentinel payment address for legacy invoices.
+	// Invoices with this payment address are special-cased in the insertion
+	// logic to prevent being indexed in the payment address index,
+	// otherwise they would cause collisions after the first insertion.
+	BlankPayAddr [32]byte
 
 	// invoiceBucket is the name of the bucket within the database that
 	// stores all data related to invoices no matter their final state.
@@ -35,6 +42,16 @@ var (
 	//
 	// maps: payHash => invoiceKey
 	invoiceIndexBucket = []byte("paymenthashes")
+
+	// payAddrIndexBucket is the name of the top-level bucket that maps
+	// payment addresses to their invoice number. This can be used
+	// to efficiently query or update non-legacy invoices. Note that legacy
+	// invoices will not be included in this index since they all have the
+	// same, all-zero payment address, however all newly generated invoices
+	// will end up in this index.
+	//
+	// maps: payAddr => invoiceKey
+	payAddrIndexBucket = []byte("pay-addr-index")
 
 	// numInvoicesKey is the name of key which houses the auto-incrementing
 	// invoice ID which is essentially used as a primary key. With each
@@ -77,16 +94,24 @@ var (
 
 	// ErrInvoiceStillOpen is returned when the invoice is still open.
 	ErrInvoiceStillOpen = errors.New("invoice still open")
+
+	// ErrInvoiceCannotOpen is returned when an attempt is made to move an
+	// invoice to the open state.
+	ErrInvoiceCannotOpen = errors.New("cannot move invoice to open")
+
+	// ErrInvoiceCannotAccept is returned when an attempt is made to accept
+	// an invoice while the invoice is not in the open state.
+	ErrInvoiceCannotAccept = errors.New("cannot accept invoice")
+
+	// ErrInvoicePreimageMismatch is returned when the preimage doesn't
+	// match the invoice hash.
+	ErrInvoicePreimageMismatch = errors.New("preimage does not match")
 )
 
 const (
 	// MaxMemoSize is maximum size of the memo field within invoices stored
 	// in the database.
 	MaxMemoSize = 1024
-
-	// MaxReceiptSize is the maximum size of the payment receipt stored
-	// within the database along side incoming/outgoing invoices.
-	MaxReceiptSize = 1024
 
 	// MaxPaymentRequestSize is the max size of a payment request for
 	// this invoice.
@@ -96,6 +121,11 @@ const (
 
 	// A set of tlv type definitions used to serialize invoice htlcs to the
 	// database.
+	//
+	// NOTE: A migration should be added whenever this list changes. This
+	// prevents against the database being rolled back to an older
+	// format where the surrounding logic might assume a different set of
+	// fields are known.
 	chanIDType       tlv.Type = 1
 	htlcIDType       tlv.Type = 3
 	amtType          tlv.Type = 5
@@ -103,8 +133,94 @@ const (
 	acceptTimeType   tlv.Type = 9
 	resolveTimeType  tlv.Type = 11
 	expiryHeightType tlv.Type = 13
-	stateType        tlv.Type = 15
+	htlcStateType    tlv.Type = 15
+	mppTotalAmtType  tlv.Type = 17
+
+	// A set of tlv type definitions used to serialize invoice bodiees.
+	//
+	// NOTE: A migration should be added whenever this list changes. This
+	// prevents against the database being rolled back to an older
+	// format where the surrounding logic might assume a different set of
+	// fields are known.
+	memoType        tlv.Type = 0
+	payReqType      tlv.Type = 1
+	createTimeType  tlv.Type = 2
+	settleTimeType  tlv.Type = 3
+	addIndexType    tlv.Type = 4
+	settleIndexType tlv.Type = 5
+	preimageType    tlv.Type = 6
+	valueType       tlv.Type = 7
+	cltvDeltaType   tlv.Type = 8
+	expiryType      tlv.Type = 9
+	paymentAddrType tlv.Type = 10
+	featuresType    tlv.Type = 11
+	invStateType    tlv.Type = 12
+	amtPaidType     tlv.Type = 13
+	hodlInvoiceType tlv.Type = 14
 )
+
+// InvoiceRef is a composite identifier for invoices. Invoices can be referenced
+// by various combinations of payment hash and payment addr, in certain contexts
+// only some of these are known. An InvoiceRef and its constructors thus
+// encapsulate the valid combinations of query parameters that can be supplied
+// to LookupInvoice and UpdateInvoice.
+type InvoiceRef struct {
+	// payHash is the payment hash of the target invoice. All invoices are
+	// currently indexed by payment hash. This value will be used as a
+	// fallback when no payment address is known.
+	payHash lntypes.Hash
+
+	// payAddr is the payment addr of the target invoice. Newer invoices
+	// (0.11 and up) are indexed by payment address in addition to payment
+	// hash, but pre 0.8 invoices do not have one at all. When this value is
+	// known it will be used as the primary identifier, falling back to
+	// payHash if no value is known.
+	payAddr *[32]byte
+}
+
+// InvoiceRefByHash creates an InvoiceRef that queries for an invoice only by
+// its payment hash.
+func InvoiceRefByHash(payHash lntypes.Hash) InvoiceRef {
+	return InvoiceRef{
+		payHash: payHash,
+	}
+}
+
+// InvoiceRefByHashAndAddr creates an InvoiceRef that first queries for an
+// invoice by the provided payment address, falling back to the payment hash if
+// the payment address is unknown.
+func InvoiceRefByHashAndAddr(payHash lntypes.Hash,
+	payAddr [32]byte) InvoiceRef {
+
+	return InvoiceRef{
+		payHash: payHash,
+		payAddr: &payAddr,
+	}
+}
+
+// PayHash returns the target invoice's payment hash.
+func (r InvoiceRef) PayHash() lntypes.Hash {
+	return r.payHash
+}
+
+// PayAddr returns the optional payment address of the target invoice.
+//
+// NOTE: This value may be nil.
+func (r InvoiceRef) PayAddr() *[32]byte {
+	if r.payAddr != nil {
+		addr := *r.payAddr
+		return &addr
+	}
+	return nil
+}
+
+// String returns a human-readable representation of an InvoiceRef.
+func (r InvoiceRef) String() string {
+	if r.payAddr != nil {
+		return fmt.Sprintf("(pay_hash=%v, pay_addr=%x)", r.payHash, *r.payAddr)
+	}
+	return fmt.Sprintf("(pay_hash=%v)", r.payHash)
+}
 
 // ContractState describes the state the invoice is in.
 type ContractState uint8
@@ -113,15 +229,13 @@ const (
 	// ContractOpen means the invoice has only been created.
 	ContractOpen ContractState = 0
 
-	// ContractSettled means the htlc is settled and the invoice has been
-	// paid.
+	// ContractSettled means the htlc is settled and the invoice has been paid.
 	ContractSettled ContractState = 1
 
 	// ContractCanceled means the invoice has been canceled.
 	ContractCanceled ContractState = 2
 
-	// ContractAccepted means the HTLC has been accepted but not settled
-	// yet.
+	// ContractAccepted means the HTLC has been accepted but not settled yet.
 	ContractAccepted ContractState = 3
 )
 
@@ -145,17 +259,34 @@ func (c ContractState) String() string {
 // the necessary conditions required before the invoice can be considered fully
 // settled by the payee.
 type ContractTerm struct {
+	// FinalCltvDelta is the minimum required number of blocks before htlc
+	// expiry when the invoice is accepted.
+	FinalCltvDelta int32
+
+	// Expiry defines how long after creation this invoice should expire.
+	Expiry time.Duration
+
 	// PaymentPreimage is the preimage which is to be revealed in the
 	// occasion that an HTLC paying to the hash of this preimage is
-	// extended.
-	PaymentPreimage lntypes.Preimage
+	// extended. Set to nil if the preimage isn't known yet.
+	PaymentPreimage *lntypes.Preimage
 
 	// Value is the expected amount of milli-satoshis to be paid to an HTLC
 	// which can be satisfied by the above preimage.
 	Value lnwire.MilliSatoshi
 
-	// State describes the state the invoice is in.
-	State ContractState
+	// PaymentAddr is a randomly generated value include in the MPP record
+	// by the sender to prevent probing of the receiver.
+	PaymentAddr [32]byte
+
+	// Features is the feature vectors advertised on the payment request.
+	Features *lnwire.FeatureVector
+}
+
+// String returns a human-readable description of the prominent contract terms.
+func (c ContractTerm) String() string {
+	return fmt.Sprintf("amt=%v, expiry=%v, final_cltv_delta=%v", c.Value,
+		c.Expiry, c.FinalCltvDelta)
 }
 
 // Invoice is a payment invoice generated by a payee in order to request
@@ -174,22 +305,9 @@ type Invoice struct {
 	// or any other message which fits within the size constraints.
 	Memo []byte
 
-	// Receipt is an optional field dedicated for storing a
-	// cryptographically binding receipt of payment.
-	//
-	// TODO(roasbeef): document scheme.
-	Receipt []byte
-
-	// PaymentRequest is an optional field where a payment request created
-	// for this invoice can be stored.
+	// PaymentRequest is the encoded payment request for this invoice. For
+	// spontaneous (keysend) payments, this field will be empty.
 	PaymentRequest []byte
-
-	// FinalCltvDelta is the minimum required number of blocks before htlc
-	// expiry when the invoice is accepted.
-	FinalCltvDelta int32
-
-	// Expiry defines how long after creation this invoice should expire.
-	Expiry time.Duration
 
 	// CreationDate is the exact time the invoice was created.
 	CreationDate time.Time
@@ -223,6 +341,9 @@ type Invoice struct {
 	// NOTE: This index starts at 1.
 	SettleIndex uint64
 
+	// State describes the state the invoice is in.
+	State ContractState
+
 	// AmtPaid is the final amount that we ultimately accepted for pay for
 	// this invoice. We specify this value independently as it's possible
 	// that the invoice originally didn't specify an amount, or the sender
@@ -232,6 +353,10 @@ type Invoice struct {
 	// Htlcs records all htlcs that paid to this invoice. Some of these
 	// htlcs may have been marked as canceled.
 	Htlcs map[CircuitKey]*InvoiceHTLC
+
+	// HodlInvoice indicates whether the invoice should be held in the
+	// Accepted state or be settled right away.
+	HodlInvoice bool
 }
 
 // HtlcState defines the states an htlc paying to an invoice can be in.
@@ -254,6 +379,10 @@ type InvoiceHTLC struct {
 	// Amt is the amount that is carried by this htlc.
 	Amt lnwire.MilliSatoshi
 
+	// MppTotalAmt is a field for mpp that indicates the expected total
+	// amount.
+	MppTotalAmt lnwire.MilliSatoshi
+
 	// AcceptHeight is the block height at which the invoice registry
 	// decided to accept this htlc as a payment to the invoice. At this
 	// height, the invoice cltv delay must have been met.
@@ -274,6 +403,10 @@ type InvoiceHTLC struct {
 	// canceled htlc isn't just removed from the invoice htlcs map, because
 	// we need AcceptHeight to properly cancel the htlc back.
 	State HtlcState
+
+	// CustomRecords contains the custom key/value pairs that accompanied
+	// the htlc.
+	CustomRecords record.CustomSet
 }
 
 // HtlcAcceptDesc describes the details of a newly accepted htlc.
@@ -284,45 +417,74 @@ type HtlcAcceptDesc struct {
 	// Amt is the amount that is carried by this htlc.
 	Amt lnwire.MilliSatoshi
 
+	// MppTotalAmt is a field for mpp that indicates the expected total
+	// amount.
+	MppTotalAmt lnwire.MilliSatoshi
+
 	// Expiry is the expiry height of this htlc.
 	Expiry uint32
+
+	// CustomRecords contains the custom key/value pairs that accompanied
+	// the htlc.
+	CustomRecords record.CustomSet
 }
 
 // InvoiceUpdateDesc describes the changes that should be applied to the
 // invoice.
 type InvoiceUpdateDesc struct {
-	// State is the new state that this invoice should progress to.
-	State ContractState
+	// State is the new state that this invoice should progress to. If nil,
+	// the state is left unchanged.
+	State *InvoiceStateUpdateDesc
 
-	// Htlcs describes the changes that need to be made to the invoice htlcs
-	// in the database. Htlc map entries with their value set should be
-	// added. If the map value is nil, the htlc should be canceled.
-	Htlcs map[CircuitKey]*HtlcAcceptDesc
+	// CancelHtlcs describes the htlcs that need to be canceled.
+	CancelHtlcs map[CircuitKey]struct{}
 
-	// Preimage must be set to the preimage when state is settled.
-	Preimage lntypes.Preimage
+	// AddHtlcs describes the newly accepted htlcs that need to be added to
+	// the invoice.
+	AddHtlcs map[CircuitKey]*HtlcAcceptDesc
+}
+
+// InvoiceStateUpdateDesc describes an invoice-level state transition.
+type InvoiceStateUpdateDesc struct {
+	// NewState is the new state that this invoice should progress to.
+	NewState ContractState
+
+	// Preimage must be set to the preimage when NewState is settled.
+	Preimage *lntypes.Preimage
 }
 
 // InvoiceUpdateCallback is a callback used in the db transaction to update the
 // invoice.
 type InvoiceUpdateCallback = func(invoice *Invoice) (*InvoiceUpdateDesc, error)
 
-func validateInvoice(i *Invoice) error {
+func validateInvoice(i *Invoice, paymentHash lntypes.Hash) error {
+	// Avoid conflicts with all-zeroes magic value in the database.
+	if paymentHash == unknownPreimage.Hash() {
+		return fmt.Errorf("cannot use hash of all-zeroes preimage")
+	}
+
 	if len(i.Memo) > MaxMemoSize {
 		return fmt.Errorf("max length a memo is %v, and invoice "+
 			"of length %v was provided", MaxMemoSize, len(i.Memo))
-	}
-	if len(i.Receipt) > MaxReceiptSize {
-		return fmt.Errorf("max length a receipt is %v, and invoice "+
-			"of length %v was provided", MaxReceiptSize,
-			len(i.Receipt))
 	}
 	if len(i.PaymentRequest) > MaxPaymentRequestSize {
 		return fmt.Errorf("max length of payment request is %v, length "+
 			"provided was %v", MaxPaymentRequestSize,
 			len(i.PaymentRequest))
 	}
+	if i.Terms.Features == nil {
+		return errors.New("invoice must have a feature vector")
+	}
+
+	if i.Terms.PaymentPreimage == nil && !i.HodlInvoice {
+		return errors.New("non-hodl invoices must have a preimage")
+	}
 	return nil
+}
+
+// IsPending returns ture if the invoice is in ContractOpen state.
+func (i *Invoice) IsPending() bool {
+	return i.State == ContractOpen || i.State == ContractAccepted
 }
 
 // AddInvoice inserts the targeted invoice into the database. If the invoice has
@@ -333,13 +495,13 @@ func validateInvoice(i *Invoice) error {
 func (d *DB) AddInvoice(newInvoice *Invoice, paymentHash lntypes.Hash) (
 	uint64, error) {
 
-	if err := validateInvoice(newInvoice); err != nil {
+	if err := validateInvoice(newInvoice, paymentHash); err != nil {
 		return 0, err
 	}
 
 	var invoiceAddIndex uint64
-	err := d.Update(func(tx *bbolt.Tx) error {
-		invoices, err := tx.CreateBucketIfNotExists(invoiceBucket)
+	err := kvdb.Update(d, func(tx kvdb.RwTx) error {
+		invoices, err := tx.CreateTopLevelBucket(invoiceBucket)
 		if err != nil {
 			return err
 		}
@@ -363,6 +525,18 @@ func (d *DB) AddInvoice(newInvoice *Invoice, paymentHash lntypes.Hash) (
 			return ErrDuplicateInvoice
 		}
 
+		// Check that we aren't inserting an invoice with a duplicate
+		// payment address. The all-zeros payment address is
+		// special-cased to support legacy keysend invoices which don't
+		// assign one. This is safe since later we also will avoid
+		// indexing them and avoid collisions.
+		payAddrIndex := tx.ReadWriteBucket(payAddrIndexBucket)
+		if newInvoice.Terms.PaymentAddr != BlankPayAddr {
+			if payAddrIndex.Get(newInvoice.Terms.PaymentAddr[:]) != nil {
+				return ErrDuplicatePayAddr
+			}
+		}
+
 		// If the current running payment ID counter hasn't yet been
 		// created, then create it now.
 		var invoiceNum uint32
@@ -379,8 +553,8 @@ func (d *DB) AddInvoice(newInvoice *Invoice, paymentHash lntypes.Hash) (
 		}
 
 		newIndex, err := putInvoice(
-			invoices, invoiceIndex, addIndex, newInvoice, invoiceNum,
-			paymentHash,
+			invoices, invoiceIndex, payAddrIndex, addIndex,
+			newInvoice, invoiceNum, paymentHash,
 		)
 		if err != nil {
 			return err
@@ -416,21 +590,21 @@ func (d *DB) InvoicesAddedSince(sinceAddIndex uint64) ([]Invoice, error) {
 	var startIndex [8]byte
 	byteOrder.PutUint64(startIndex[:], sinceAddIndex)
 
-	err := d.DB.View(func(tx *bbolt.Tx) error {
-		invoices := tx.Bucket(invoiceBucket)
+	err := kvdb.View(d, func(tx kvdb.RTx) error {
+		invoices := tx.ReadBucket(invoiceBucket)
 		if invoices == nil {
-			return ErrNoInvoicesCreated
+			return nil
 		}
 
-		addIndex := invoices.Bucket(addIndexBucket)
+		addIndex := invoices.NestedReadBucket(addIndexBucket)
 		if addIndex == nil {
-			return ErrNoInvoicesCreated
+			return nil
 		}
 
 		// We'll now run through each entry in the add index starting
 		// at our starting index. We'll continue until we reach the
 		// very end of the current key space.
-		invoiceCursor := addIndex.Cursor()
+		invoiceCursor := addIndex.ReadCursor()
 
 		// We'll seek to the starting index, then manually advance the
 		// cursor in order to skip the entry with the since add index.
@@ -451,12 +625,7 @@ func (d *DB) InvoicesAddedSince(sinceAddIndex uint64) ([]Invoice, error) {
 
 		return nil
 	})
-	switch {
-	// If no invoices have been created, then we'll return the empty set of
-	// invoices.
-	case err == ErrNoInvoicesCreated:
-
-	case err != nil:
+	if err != nil {
 		return nil, err
 	}
 
@@ -469,27 +638,30 @@ func (d *DB) InvoicesAddedSince(sinceAddIndex uint64) ([]Invoice, error) {
 // full invoice is returned. Before setting the incoming HTLC, the values
 // SHOULD be checked to ensure the payer meets the agreed upon contractual
 // terms of the payment.
-func (d *DB) LookupInvoice(paymentHash [32]byte) (Invoice, error) {
+func (d *DB) LookupInvoice(ref InvoiceRef) (Invoice, error) {
 	var invoice Invoice
-	err := d.View(func(tx *bbolt.Tx) error {
-		invoices := tx.Bucket(invoiceBucket)
+	err := kvdb.View(d, func(tx kvdb.RTx) error {
+		invoices := tx.ReadBucket(invoiceBucket)
 		if invoices == nil {
 			return ErrNoInvoicesCreated
 		}
-		invoiceIndex := invoices.Bucket(invoiceIndexBucket)
+		invoiceIndex := invoices.NestedReadBucket(invoiceIndexBucket)
 		if invoiceIndex == nil {
 			return ErrNoInvoicesCreated
 		}
+		payAddrIndex := tx.ReadBucket(payAddrIndexBucket)
 
-		// Check the invoice index to see if an invoice paying to this
-		// hash exists within the DB.
-		invoiceNum := invoiceIndex.Get(paymentHash[:])
-		if invoiceNum == nil {
-			return ErrInvoiceNotFound
+		// Retrieve the invoice number for this invoice using the
+		// provided invoice reference.
+		invoiceNum, err := fetchInvoiceNumByRef(
+			invoiceIndex, payAddrIndex, ref,
+		)
+		if err != nil {
+			return err
 		}
 
-		// An invoice matching the payment hash has been found, so
-		// retrieve the record of the invoice itself.
+		// An invoice was found, retrieve the remainder of the invoice
+		// body.
 		i, err := fetchInvoice(invoiceNum, invoices)
 		if err != nil {
 			return err
@@ -505,48 +677,124 @@ func (d *DB) LookupInvoice(paymentHash [32]byte) (Invoice, error) {
 	return invoice, nil
 }
 
-// FetchAllInvoices returns all invoices currently stored within the database.
-// If the pendingOnly param is true, then only unsettled invoices will be
-// returned, skipping all invoices that are fully settled.
-func (d *DB) FetchAllInvoices(pendingOnly bool) ([]Invoice, error) {
-	var invoices []Invoice
+// fetchInvoiceNumByRef retrieve the invoice number for the provided invoice
+// reference. The payment address will be treated as the primary key, falling
+// back to the payment hash if nothing is found for the payment address. An
+// error is returned if the invoice is not found.
+func fetchInvoiceNumByRef(invoiceIndex, payAddrIndex kvdb.RBucket,
+	ref InvoiceRef) ([]byte, error) {
 
-	err := d.View(func(tx *bbolt.Tx) error {
-		invoiceB := tx.Bucket(invoiceBucket)
-		if invoiceB == nil {
+	payHash := ref.PayHash()
+	payAddr := ref.PayAddr()
+
+	var (
+		invoiceNumByHash = invoiceIndex.Get(payHash[:])
+		invoiceNumByAddr []byte
+	)
+	if payAddr != nil {
+		// Only allow lookups for payment address if it is not a blank
+		// payment address, which is a special-cased value for legacy
+		// keysend invoices.
+		if *payAddr != BlankPayAddr {
+			invoiceNumByAddr = payAddrIndex.Get(payAddr[:])
+		}
+	}
+
+	switch {
+
+	// If payment address and payment hash both reference an existing
+	// invoice, ensure they reference the _same_ invoice.
+	case invoiceNumByAddr != nil && invoiceNumByHash != nil:
+		if !bytes.Equal(invoiceNumByAddr, invoiceNumByHash) {
+			return nil, ErrInvRefEquivocation
+		}
+
+		return invoiceNumByAddr, nil
+
+	// If we were only able to reference the invoice by hash, return the
+	// corresponding invoice number. This can happen when no payment address
+	// was provided, or if it didn't match anything in our records.
+	case invoiceNumByHash != nil:
+		return invoiceNumByHash, nil
+
+	// Otherwise we don't know of the target invoice.
+	default:
+		return nil, ErrInvoiceNotFound
+	}
+}
+
+// InvoiceWithPaymentHash is used to store an invoice and its corresponding
+// payment hash. This struct is only used to store results of
+// ChannelDB.FetchAllInvoicesWithPaymentHash() call.
+type InvoiceWithPaymentHash struct {
+	// Invoice holds the invoice as selected from the invoices bucket.
+	Invoice Invoice
+
+	// PaymentHash is the payment hash for the Invoice.
+	PaymentHash lntypes.Hash
+}
+
+// FetchAllInvoicesWithPaymentHash returns all invoices and their payment hashes
+// currently stored within the database. If the pendingOnly param is true, then
+// only open or accepted invoices and their payment hashes will be returned,
+// skipping all invoices that are fully settled or canceled. Note that the
+// returned array is not ordered by add index.
+func (d *DB) FetchAllInvoicesWithPaymentHash(pendingOnly bool) (
+	[]InvoiceWithPaymentHash, error) {
+
+	var result []InvoiceWithPaymentHash
+
+	err := kvdb.View(d, func(tx kvdb.RTx) error {
+		invoices := tx.ReadBucket(invoiceBucket)
+		if invoices == nil {
 			return ErrNoInvoicesCreated
 		}
 
-		// Iterate through the entire key space of the top-level
-		// invoice bucket. If key with a non-nil value stores the next
-		// invoice ID which maps to the corresponding invoice.
-		return invoiceB.ForEach(func(k, v []byte) error {
+		invoiceIndex := invoices.NestedReadBucket(invoiceIndexBucket)
+		if invoiceIndex == nil {
+			// Mask the error if there's no invoice
+			// index as that simply means there are no
+			// invoices added yet to the DB. In this case
+			// we simply return an empty list.
+			return nil
+		}
+
+		return invoiceIndex.ForEach(func(k, v []byte) error {
+			// Skip the special numInvoicesKey as that does not
+			// point to a valid invoice.
+			if bytes.Equal(k, numInvoicesKey) {
+				return nil
+			}
+
 			if v == nil {
 				return nil
 			}
 
-			invoiceReader := bytes.NewReader(v)
-			invoice, err := deserializeInvoice(invoiceReader)
+			invoice, err := fetchInvoice(v, invoices)
 			if err != nil {
 				return err
 			}
 
-			if pendingOnly &&
-				invoice.Terms.State == ContractSettled {
-
+			if pendingOnly && !invoice.IsPending() {
 				return nil
 			}
 
-			invoices = append(invoices, invoice)
+			invoiceWithPaymentHash := InvoiceWithPaymentHash{
+				Invoice: invoice,
+			}
+
+			copy(invoiceWithPaymentHash.PaymentHash[:], k)
+			result = append(result, invoiceWithPaymentHash)
 
 			return nil
 		})
 	})
+
 	if err != nil {
 		return nil, err
 	}
 
-	return invoices, nil
+	return result, nil
 }
 
 // InvoiceQuery represents a query to the invoice database. The query allows a
@@ -602,94 +850,54 @@ func (d *DB) QueryInvoices(q InvoiceQuery) (InvoiceSlice, error) {
 		InvoiceQuery: q,
 	}
 
-	err := d.View(func(tx *bbolt.Tx) error {
+	err := kvdb.View(d, func(tx kvdb.RTx) error {
 		// If the bucket wasn't found, then there aren't any invoices
 		// within the database yet, so we can simply exit.
-		invoices := tx.Bucket(invoiceBucket)
+		invoices := tx.ReadBucket(invoiceBucket)
 		if invoices == nil {
 			return ErrNoInvoicesCreated
 		}
-		invoiceAddIndex := invoices.Bucket(addIndexBucket)
+
+		// Get the add index bucket which we will use to iterate through
+		// our indexed invoices.
+		invoiceAddIndex := invoices.NestedReadBucket(addIndexBucket)
 		if invoiceAddIndex == nil {
 			return ErrNoInvoicesCreated
 		}
 
-		// keyForIndex is a helper closure that retrieves the invoice
-		// key for the given add index of an invoice.
-		keyForIndex := func(c *bbolt.Cursor, index uint64) []byte {
-			var keyIndex [8]byte
-			byteOrder.PutUint64(keyIndex[:], index)
-			_, invoiceKey := c.Seek(keyIndex[:])
-			return invoiceKey
-		}
+		// Create a paginator which reads from our add index bucket with
+		// the parameters provided by the invoice query.
+		paginator := newPaginator(
+			invoiceAddIndex.ReadCursor(), q.Reversed, q.IndexOffset,
+			q.NumMaxInvoices,
+		)
 
-		// nextKey is a helper closure to determine what the next
-		// invoice key is when iterating over the invoice add index.
-		nextKey := func(c *bbolt.Cursor) ([]byte, []byte) {
-			if q.Reversed {
-				return c.Prev()
-			}
-			return c.Next()
-		}
-
-		// We'll be using a cursor to seek into the database and return
-		// a slice of invoices. We'll need to determine where to start
-		// our cursor depending on the parameters set within the query.
-		c := invoiceAddIndex.Cursor()
-		invoiceKey := keyForIndex(c, q.IndexOffset+1)
-
-		// If the query is specifying reverse iteration, then we must
-		// handle a few offset cases.
-		if q.Reversed {
-			switch q.IndexOffset {
-
-			// This indicates the default case, where no offset was
-			// specified. In that case we just start from the last
-			// invoice.
-			case 0:
-				_, invoiceKey = c.Last()
-
-			// This indicates the offset being set to the very
-			// first invoice. Since there are no invoices before
-			// this offset, and the direction is reversed, we can
-			// return without adding any invoices to the response.
-			case 1:
-				return nil
-
-			// Otherwise we start iteration at the invoice prior to
-			// the offset.
-			default:
-				invoiceKey = keyForIndex(c, q.IndexOffset-1)
-			}
-		}
-
-		// If we know that a set of invoices exists, then we'll begin
-		// our seek through the bucket in order to satisfy the query.
-		// We'll continue until either we reach the end of the range, or
-		// reach our max number of invoices.
-		for ; invoiceKey != nil; _, invoiceKey = nextKey(c) {
-			// If our current return payload exceeds the max number
-			// of invoices, then we'll exit now.
-			if uint64(len(resp.Invoices)) >= q.NumMaxInvoices {
-				break
-			}
-
-			invoice, err := fetchInvoice(invoiceKey, invoices)
+		// accumulateInvoices looks up an invoice based on the index we
+		// are given, adds it to our set of invoices if it has the right
+		// characteristics for our query and returns the number of items
+		// we have added to our set of invoices.
+		accumulateInvoices := func(_, indexValue []byte) (bool, error) {
+			invoice, err := fetchInvoice(indexValue, invoices)
 			if err != nil {
-				return err
+				return false, err
 			}
 
-			// Skip any settled invoices if the caller is only
-			// interested in unsettled.
-			if q.PendingOnly &&
-				invoice.Terms.State == ContractSettled {
-
-				continue
+			// Skip any settled or canceled invoices if the caller
+			// is only interested in pending ones.
+			if q.PendingOnly && !invoice.IsPending() {
+				return false, nil
 			}
 
 			// At this point, we've exhausted the offset, so we'll
 			// begin collecting invoices found within the range.
 			resp.Invoices = append(resp.Invoices, invoice)
+			return true, nil
+		}
+
+		// Query our paginator using accumulateInvoices to build up a
+		// set of invoices.
+		if err := paginator.query(accumulateInvoices); err != nil {
+			return err
 		}
 
 		// If we iterated through the add index in reverse order, then
@@ -727,12 +935,12 @@ func (d *DB) QueryInvoices(q InvoiceQuery) (InvoiceSlice, error) {
 // The update is performed inside the same database transaction that fetches the
 // invoice and is therefore atomic. The fields to update are controlled by the
 // supplied callback.
-func (d *DB) UpdateInvoice(paymentHash lntypes.Hash,
+func (d *DB) UpdateInvoice(ref InvoiceRef,
 	callback InvoiceUpdateCallback) (*Invoice, error) {
 
 	var updatedInvoice *Invoice
-	err := d.Update(func(tx *bbolt.Tx) error {
-		invoices, err := tx.CreateBucketIfNotExists(invoiceBucket)
+	err := kvdb.Update(d, func(tx kvdb.RwTx) error {
+		invoices, err := tx.CreateTopLevelBucket(invoiceBucket)
 		if err != nil {
 			return err
 		}
@@ -748,16 +956,20 @@ func (d *DB) UpdateInvoice(paymentHash lntypes.Hash,
 		if err != nil {
 			return err
 		}
+		payAddrIndex := tx.ReadBucket(payAddrIndexBucket)
 
-		// Check the invoice index to see if an invoice paying to this
-		// hash exists within the DB.
-		invoiceNum := invoiceIndex.Get(paymentHash[:])
-		if invoiceNum == nil {
-			return ErrInvoiceNotFound
+		// Retrieve the invoice number for this invoice using the
+		// provided invoice reference.
+		invoiceNum, err := fetchInvoiceNumByRef(
+			invoiceIndex, payAddrIndex, ref,
+		)
+		if err != nil {
+			return err
+
 		}
-
+		payHash := ref.PayHash()
 		updatedInvoice, err = d.updateInvoice(
-			paymentHash, invoices, settleIndex, invoiceNum,
+			payHash, invoices, settleIndex, invoiceNum,
 			callback,
 		)
 
@@ -786,21 +998,21 @@ func (d *DB) InvoicesSettledSince(sinceSettleIndex uint64) ([]Invoice, error) {
 	var startIndex [8]byte
 	byteOrder.PutUint64(startIndex[:], sinceSettleIndex)
 
-	err := d.DB.View(func(tx *bbolt.Tx) error {
-		invoices := tx.Bucket(invoiceBucket)
+	err := kvdb.View(d, func(tx kvdb.RTx) error {
+		invoices := tx.ReadBucket(invoiceBucket)
 		if invoices == nil {
-			return ErrNoInvoicesCreated
+			return nil
 		}
 
-		settleIndex := invoices.Bucket(settleIndexBucket)
+		settleIndex := invoices.NestedReadBucket(settleIndexBucket)
 		if settleIndex == nil {
-			return ErrNoInvoicesCreated
+			return nil
 		}
 
 		// We'll now run through each entry in the add index starting
 		// at our starting index. We'll continue until we reach the
 		// very end of the current key space.
-		invoiceCursor := settleIndex.Cursor()
+		invoiceCursor := settleIndex.ReadCursor()
 
 		// We'll seek to the starting index, then manually advance the
 		// cursor in order to skip the entry with the since add index.
@@ -828,7 +1040,7 @@ func (d *DB) InvoicesSettledSince(sinceSettleIndex uint64) ([]Invoice, error) {
 	return settledInvoices, nil
 }
 
-func putInvoice(invoices, invoiceIndex, addIndex *bbolt.Bucket,
+func putInvoice(invoices, invoiceIndex, payAddrIndex, addIndex kvdb.RwBucket,
 	i *Invoice, invoiceNum uint32, paymentHash lntypes.Hash) (
 	uint64, error) {
 
@@ -852,6 +1064,16 @@ func putInvoice(invoices, invoiceIndex, addIndex *bbolt.Bucket,
 	err := invoiceIndex.Put(paymentHash[:], invoiceKey[:])
 	if err != nil {
 		return 0, err
+	}
+	// Add the invoice to the payment address index, but only if the invoice
+	// has a non-zero payment address. The all-zero payment address is still
+	// in use by legacy keysend, so we special-case here to avoid
+	// collisions.
+	if i.Terms.PaymentAddr != BlankPayAddr {
+		err = payAddrIndex.Put(i.Terms.PaymentAddr[:], invoiceKey[:])
+		if err != nil {
+			return 0, err
+		}
 	}
 
 	// Next, we'll obtain the next add invoice index (sequence
@@ -892,71 +1114,86 @@ func putInvoice(invoices, invoiceIndex, addIndex *bbolt.Bucket,
 // would modify the on disk format, make a copy of the original code and store
 // it with the migration.
 func serializeInvoice(w io.Writer, i *Invoice) error {
-	if err := wire.WriteVarBytes(w, 0, i.Memo[:]); err != nil {
-		return err
-	}
-	if err := wire.WriteVarBytes(w, 0, i.Receipt[:]); err != nil {
-		return err
-	}
-	if err := wire.WriteVarBytes(w, 0, i.PaymentRequest[:]); err != nil {
-		return err
-	}
-
-	if err := binary.Write(w, byteOrder, i.FinalCltvDelta); err != nil {
-		return err
-	}
-
-	if err := binary.Write(w, byteOrder, int64(i.Expiry)); err != nil {
-		return err
-	}
-
-	birthBytes, err := i.CreationDate.MarshalBinary()
+	creationDateBytes, err := i.CreationDate.MarshalBinary()
 	if err != nil {
 		return err
 	}
 
-	if err := wire.WriteVarBytes(w, 0, birthBytes); err != nil {
-		return err
-	}
-
-	settleBytes, err := i.SettleDate.MarshalBinary()
+	settleDateBytes, err := i.SettleDate.MarshalBinary()
 	if err != nil {
 		return err
 	}
 
-	if err := wire.WriteVarBytes(w, 0, settleBytes); err != nil {
+	var fb bytes.Buffer
+	err = i.Terms.Features.EncodeBase256(&fb)
+	if err != nil {
+		return err
+	}
+	featureBytes := fb.Bytes()
+
+	preimage := [32]byte(unknownPreimage)
+	if i.Terms.PaymentPreimage != nil {
+		preimage = *i.Terms.PaymentPreimage
+		if preimage == unknownPreimage {
+			return errors.New("cannot use all-zeroes preimage")
+		}
+	}
+	value := uint64(i.Terms.Value)
+	cltvDelta := uint32(i.Terms.FinalCltvDelta)
+	expiry := uint64(i.Terms.Expiry)
+
+	amtPaid := uint64(i.AmtPaid)
+	state := uint8(i.State)
+
+	var hodlInvoice uint8
+	if i.HodlInvoice {
+		hodlInvoice = 1
+	}
+
+	tlvStream, err := tlv.NewStream(
+		// Memo and payreq.
+		tlv.MakePrimitiveRecord(memoType, &i.Memo),
+		tlv.MakePrimitiveRecord(payReqType, &i.PaymentRequest),
+
+		// Add/settle metadata.
+		tlv.MakePrimitiveRecord(createTimeType, &creationDateBytes),
+		tlv.MakePrimitiveRecord(settleTimeType, &settleDateBytes),
+		tlv.MakePrimitiveRecord(addIndexType, &i.AddIndex),
+		tlv.MakePrimitiveRecord(settleIndexType, &i.SettleIndex),
+
+		// Terms.
+		tlv.MakePrimitiveRecord(preimageType, &preimage),
+		tlv.MakePrimitiveRecord(valueType, &value),
+		tlv.MakePrimitiveRecord(cltvDeltaType, &cltvDelta),
+		tlv.MakePrimitiveRecord(expiryType, &expiry),
+		tlv.MakePrimitiveRecord(paymentAddrType, &i.Terms.PaymentAddr),
+		tlv.MakePrimitiveRecord(featuresType, &featureBytes),
+
+		// Invoice state.
+		tlv.MakePrimitiveRecord(invStateType, &state),
+		tlv.MakePrimitiveRecord(amtPaidType, &amtPaid),
+
+		tlv.MakePrimitiveRecord(hodlInvoiceType, &hodlInvoice),
+	)
+	if err != nil {
 		return err
 	}
 
-	if _, err := w.Write(i.Terms.PaymentPreimage[:]); err != nil {
+	var b bytes.Buffer
+	if err = tlvStream.Encode(&b); err != nil {
 		return err
 	}
 
-	var scratch [8]byte
-	byteOrder.PutUint64(scratch[:], uint64(i.Terms.Value))
-	if _, err := w.Write(scratch[:]); err != nil {
+	err = binary.Write(w, byteOrder, uint64(b.Len()))
+	if err != nil {
 		return err
 	}
 
-	if err := binary.Write(w, byteOrder, i.Terms.State); err != nil {
+	if _, err = w.Write(b.Bytes()); err != nil {
 		return err
 	}
 
-	if err := binary.Write(w, byteOrder, i.AddIndex); err != nil {
-		return err
-	}
-	if err := binary.Write(w, byteOrder, i.SettleIndex); err != nil {
-		return err
-	}
-	if err := binary.Write(w, byteOrder, int64(i.AmtPaid)); err != nil {
-		return err
-	}
-
-	if err := serializeHtlcs(w, i.Htlcs); err != nil {
-		return err
-	}
-
-	return nil
+	return serializeHtlcs(w, i.Htlcs)
 }
 
 // serializeHtlcs serializes a map containing circuit keys and invoice htlcs to
@@ -966,11 +1203,13 @@ func serializeHtlcs(w io.Writer, htlcs map[CircuitKey]*InvoiceHTLC) error {
 		// Encode the htlc in a tlv stream.
 		chanID := key.ChanID.ToUint64()
 		amt := uint64(htlc.Amt)
+		mppTotalAmt := uint64(htlc.MppTotalAmt)
 		acceptTime := uint64(htlc.AcceptTime.UnixNano())
 		resolveTime := uint64(htlc.ResolveTime.UnixNano())
 		state := uint8(htlc.State)
 
-		tlvStream, err := tlv.NewStream(
+		var records []tlv.Record
+		records = append(records,
 			tlv.MakePrimitiveRecord(chanIDType, &chanID),
 			tlv.MakePrimitiveRecord(htlcIDType, &key.HtlcID),
 			tlv.MakePrimitiveRecord(amtType, &amt),
@@ -980,8 +1219,19 @@ func serializeHtlcs(w io.Writer, htlcs map[CircuitKey]*InvoiceHTLC) error {
 			tlv.MakePrimitiveRecord(acceptTimeType, &acceptTime),
 			tlv.MakePrimitiveRecord(resolveTimeType, &resolveTime),
 			tlv.MakePrimitiveRecord(expiryHeightType, &htlc.Expiry),
-			tlv.MakePrimitiveRecord(stateType, &state),
+			tlv.MakePrimitiveRecord(htlcStateType, &state),
+			tlv.MakePrimitiveRecord(mppTotalAmtType, &mppTotalAmt),
 		)
+
+		// Convert the custom records to tlv.Record types that are ready
+		// for serialization.
+		customRecords := tlv.MapToRecords(htlc.CustomRecords)
+
+		// Append the custom records. Their ids are in the experimental
+		// range and sorted, so there is no need to sort again.
+		records = append(records, customRecords...)
+
+		tlvStream, err := tlv.NewStream(records...)
 		if err != nil {
 			return err
 		}
@@ -1006,7 +1256,7 @@ func serializeHtlcs(w io.Writer, htlcs map[CircuitKey]*InvoiceHTLC) error {
 	return nil
 }
 
-func fetchInvoice(invoiceNum []byte, invoices *bbolt.Bucket) (Invoice, error) {
+func fetchInvoice(invoiceNum []byte, invoices kvdb.RBucket) (Invoice, error) {
 	invoiceBytes := invoices.Get(invoiceNum)
 	if invoiceBytes == nil {
 		return Invoice{}, ErrInvoiceNotFound
@@ -1018,89 +1268,110 @@ func fetchInvoice(invoiceNum []byte, invoices *bbolt.Bucket) (Invoice, error) {
 }
 
 func deserializeInvoice(r io.Reader) (Invoice, error) {
-	var err error
-	invoice := Invoice{}
+	var (
+		preimageBytes [32]byte
+		value         uint64
+		cltvDelta     uint32
+		expiry        uint64
+		amtPaid       uint64
+		state         uint8
+		hodlInvoice   uint8
 
-	// TODO(roasbeef): use read full everywhere
-	invoice.Memo, err = wire.ReadVarBytes(r, 0, MaxMemoSize, "")
+		creationDateBytes []byte
+		settleDateBytes   []byte
+		featureBytes      []byte
+	)
+
+	var i Invoice
+	tlvStream, err := tlv.NewStream(
+		// Memo and payreq.
+		tlv.MakePrimitiveRecord(memoType, &i.Memo),
+		tlv.MakePrimitiveRecord(payReqType, &i.PaymentRequest),
+
+		// Add/settle metadata.
+		tlv.MakePrimitiveRecord(createTimeType, &creationDateBytes),
+		tlv.MakePrimitiveRecord(settleTimeType, &settleDateBytes),
+		tlv.MakePrimitiveRecord(addIndexType, &i.AddIndex),
+		tlv.MakePrimitiveRecord(settleIndexType, &i.SettleIndex),
+
+		// Terms.
+		tlv.MakePrimitiveRecord(preimageType, &preimageBytes),
+		tlv.MakePrimitiveRecord(valueType, &value),
+		tlv.MakePrimitiveRecord(cltvDeltaType, &cltvDelta),
+		tlv.MakePrimitiveRecord(expiryType, &expiry),
+		tlv.MakePrimitiveRecord(paymentAddrType, &i.Terms.PaymentAddr),
+		tlv.MakePrimitiveRecord(featuresType, &featureBytes),
+
+		// Invoice state.
+		tlv.MakePrimitiveRecord(invStateType, &state),
+		tlv.MakePrimitiveRecord(amtPaidType, &amtPaid),
+
+		tlv.MakePrimitiveRecord(hodlInvoiceType, &hodlInvoice),
+	)
 	if err != nil {
-		return invoice, err
+		return i, err
 	}
-	invoice.Receipt, err = wire.ReadVarBytes(r, 0, MaxReceiptSize, "")
+
+	var bodyLen int64
+	err = binary.Read(r, byteOrder, &bodyLen)
 	if err != nil {
-		return invoice, err
+		return i, err
 	}
 
-	invoice.PaymentRequest, err = wire.ReadVarBytes(r, 0, MaxPaymentRequestSize, "")
+	lr := io.LimitReader(r, bodyLen)
+	if err = tlvStream.Decode(lr); err != nil {
+		return i, err
+	}
+
+	preimage := lntypes.Preimage(preimageBytes)
+	if preimage != unknownPreimage {
+		i.Terms.PaymentPreimage = &preimage
+	}
+
+	i.Terms.Value = lnwire.MilliSatoshi(value)
+	i.Terms.FinalCltvDelta = int32(cltvDelta)
+	i.Terms.Expiry = time.Duration(expiry)
+	i.AmtPaid = lnwire.MilliSatoshi(amtPaid)
+	i.State = ContractState(state)
+
+	if hodlInvoice != 0 {
+		i.HodlInvoice = true
+	}
+
+	err = i.CreationDate.UnmarshalBinary(creationDateBytes)
 	if err != nil {
-		return invoice, err
+		return i, err
 	}
 
-	if err := binary.Read(r, byteOrder, &invoice.FinalCltvDelta); err != nil {
-		return invoice, err
-	}
-
-	var expiry int64
-	if err := binary.Read(r, byteOrder, &expiry); err != nil {
-		return invoice, err
-	}
-	invoice.Expiry = time.Duration(expiry)
-
-	birthBytes, err := wire.ReadVarBytes(r, 0, 300, "birth")
+	err = i.SettleDate.UnmarshalBinary(settleDateBytes)
 	if err != nil {
-		return invoice, err
-	}
-	if err := invoice.CreationDate.UnmarshalBinary(birthBytes); err != nil {
-		return invoice, err
+		return i, err
 	}
 
-	settledBytes, err := wire.ReadVarBytes(r, 0, 300, "settled")
+	rawFeatures := lnwire.NewRawFeatureVector()
+	err = rawFeatures.DecodeBase256(
+		bytes.NewReader(featureBytes), len(featureBytes),
+	)
 	if err != nil {
-		return invoice, err
-	}
-	if err := invoice.SettleDate.UnmarshalBinary(settledBytes); err != nil {
-		return invoice, err
+		return i, err
 	}
 
-	if _, err := io.ReadFull(r, invoice.Terms.PaymentPreimage[:]); err != nil {
-		return invoice, err
-	}
-	var scratch [8]byte
-	if _, err := io.ReadFull(r, scratch[:]); err != nil {
-		return invoice, err
-	}
-	invoice.Terms.Value = lnwire.MilliSatoshi(byteOrder.Uint64(scratch[:]))
+	i.Terms.Features = lnwire.NewFeatureVector(
+		rawFeatures, lnwire.Features,
+	)
 
-	if err := binary.Read(r, byteOrder, &invoice.Terms.State); err != nil {
-		return invoice, err
-	}
-
-	if err := binary.Read(r, byteOrder, &invoice.AddIndex); err != nil {
-		return invoice, err
-	}
-	if err := binary.Read(r, byteOrder, &invoice.SettleIndex); err != nil {
-		return invoice, err
-	}
-	if err := binary.Read(r, byteOrder, &invoice.AmtPaid); err != nil {
-		return invoice, err
-	}
-
-	invoice.Htlcs, err = deserializeHtlcs(r)
-	if err != nil {
-		return Invoice{}, err
-	}
-
-	return invoice, nil
+	i.Htlcs, err = deserializeHtlcs(r)
+	return i, err
 }
 
 // deserializeHtlcs reads a list of invoice htlcs from a reader and returns it
 // as a map.
 func deserializeHtlcs(r io.Reader) (map[CircuitKey]*InvoiceHTLC, error) {
-	htlcs := make(map[CircuitKey]*InvoiceHTLC, 0)
+	htlcs := make(map[CircuitKey]*InvoiceHTLC)
 
 	for {
 		// Read the length of the tlv stream for this htlc.
-		var streamLen uint64
+		var streamLen int64
 		if err := binary.Read(r, byteOrder, &streamLen); err != nil {
 			if err == io.EOF {
 				break
@@ -1109,11 +1380,9 @@ func deserializeHtlcs(r io.Reader) (map[CircuitKey]*InvoiceHTLC, error) {
 			return nil, err
 		}
 
-		streamBytes := make([]byte, streamLen)
-		if _, err := r.Read(streamBytes); err != nil {
-			return nil, err
-		}
-		streamReader := bytes.NewReader(streamBytes)
+		// Limit the reader so that it stops at the end of this htlc's
+		// stream.
+		htlcReader := io.LimitReader(r, streamLen)
 
 		// Decode the contents into the htlc fields.
 		var (
@@ -1122,7 +1391,7 @@ func deserializeHtlcs(r io.Reader) (map[CircuitKey]*InvoiceHTLC, error) {
 			chanID                  uint64
 			state                   uint8
 			acceptTime, resolveTime uint64
-			amt                     uint64
+			amt, mppTotalAmt        uint64
 		)
 		tlvStream, err := tlv.NewStream(
 			tlv.MakePrimitiveRecord(chanIDType, &chanID),
@@ -1134,13 +1403,15 @@ func deserializeHtlcs(r io.Reader) (map[CircuitKey]*InvoiceHTLC, error) {
 			tlv.MakePrimitiveRecord(acceptTimeType, &acceptTime),
 			tlv.MakePrimitiveRecord(resolveTimeType, &resolveTime),
 			tlv.MakePrimitiveRecord(expiryHeightType, &htlc.Expiry),
-			tlv.MakePrimitiveRecord(stateType, &state),
+			tlv.MakePrimitiveRecord(htlcStateType, &state),
+			tlv.MakePrimitiveRecord(mppTotalAmtType, &mppTotalAmt),
 		)
 		if err != nil {
 			return nil, err
 		}
 
-		if err := tlvStream.Decode(streamReader); err != nil {
+		parsedTypes, err := tlvStream.DecodeWithParsedTypes(htlcReader)
+		if err != nil {
 			return nil, err
 		}
 
@@ -1149,6 +1420,11 @@ func deserializeHtlcs(r io.Reader) (map[CircuitKey]*InvoiceHTLC, error) {
 		htlc.ResolveTime = time.Unix(0, int64(resolveTime))
 		htlc.State = HtlcState(state)
 		htlc.Amt = lnwire.MilliSatoshi(amt)
+		htlc.MppTotalAmt = lnwire.MilliSatoshi(mppTotalAmt)
+
+		// Reconstruct the custom records fields from the parsed types
+		// map return from the tlv parser.
+		htlc.CustomRecords = hop.NewCustomRecords(parsedTypes)
 
 		htlcs[key] = &htlc
 	}
@@ -1163,26 +1439,46 @@ func copySlice(src []byte) []byte {
 	return dest
 }
 
+// copyInvoiceHTLC makes a deep copy of the supplied invoice HTLC.
+func copyInvoiceHTLC(src *InvoiceHTLC) *InvoiceHTLC {
+	result := *src
+
+	// Make a copy of the CustomSet map.
+	result.CustomRecords = make(record.CustomSet)
+	for k, v := range src.CustomRecords {
+		result.CustomRecords[k] = v
+	}
+
+	return &result
+}
+
 // copyInvoice makes a deep copy of the supplied invoice.
 func copyInvoice(src *Invoice) *Invoice {
 	dest := Invoice{
 		Memo:           copySlice(src.Memo),
-		Receipt:        copySlice(src.Receipt),
 		PaymentRequest: copySlice(src.PaymentRequest),
-		FinalCltvDelta: src.FinalCltvDelta,
 		CreationDate:   src.CreationDate,
 		SettleDate:     src.SettleDate,
 		Terms:          src.Terms,
 		AddIndex:       src.AddIndex,
 		SettleIndex:    src.SettleIndex,
+		State:          src.State,
 		AmtPaid:        src.AmtPaid,
 		Htlcs: make(
 			map[CircuitKey]*InvoiceHTLC, len(src.Htlcs),
 		),
+		HodlInvoice: src.HodlInvoice,
+	}
+
+	dest.Terms.Features = src.Terms.Features.Clone()
+
+	if src.Terms.PaymentPreimage != nil {
+		preimage := *src.Terms.PaymentPreimage
+		dest.Terms.PaymentPreimage = &preimage
 	}
 
 	for k, v := range src.Htlcs {
-		dest.Htlcs[k] = v
+		dest.Htlcs[k] = copyInvoiceHTLC(v)
 	}
 
 	return &dest
@@ -1190,7 +1486,7 @@ func copyInvoice(src *Invoice) *Invoice {
 
 // updateInvoice fetches the invoice, obtains the update descriptor from the
 // callback and applies the updates in a single db transaction.
-func (d *DB) updateInvoice(hash lntypes.Hash, invoices, settleIndex *bbolt.Bucket,
+func (d *DB) updateInvoice(hash lntypes.Hash, invoices, settleIndex kvdb.RwBucket,
 	invoiceNum []byte, callback InvoiceUpdateCallback) (*Invoice, error) {
 
 	invoice, err := fetchInvoice(invoiceNum, invoices)
@@ -1198,91 +1494,121 @@ func (d *DB) updateInvoice(hash lntypes.Hash, invoices, settleIndex *bbolt.Bucke
 		return nil, err
 	}
 
-	preUpdateState := invoice.Terms.State
-
 	// Create deep copy to prevent any accidental modification in the
 	// callback.
-	copy := copyInvoice(&invoice)
+	invoiceCopy := copyInvoice(&invoice)
 
 	// Call the callback and obtain the update descriptor.
-	update, err := callback(copy)
+	update, err := callback(invoiceCopy)
 	if err != nil {
 		return &invoice, err
 	}
 
-	// Update invoice state.
-	invoice.Terms.State = update.State
+	// If there is nothing to update, return early.
+	if update == nil {
+		return &invoice, nil
+	}
 
-	now := d.now()
+	now := d.clock.Now()
 
-	// Update htlc set.
-	for key, htlcUpdate := range update.Htlcs {
-		htlc, ok := invoice.Htlcs[key]
+	// Update invoice state if the update descriptor indicates an invoice
+	// state change.
+	if update.State != nil {
+		err := updateInvoiceState(&invoice, hash, *update.State)
+		if err != nil {
+			return nil, err
+		}
 
-		// No update means the htlc needs to be canceled.
-		if htlcUpdate == nil {
-			if !ok {
-				return nil, fmt.Errorf("unknown htlc %v", key)
+		if update.State.NewState == ContractSettled {
+			err := setSettleMetaFields(
+				settleIndex, invoiceNum, &invoice, now,
+			)
+			if err != nil {
+				return nil, err
 			}
-			if htlc.State != HtlcStateAccepted {
-				return nil, fmt.Errorf("can only cancel " +
-					"accepted htlcs")
+		}
+	}
+
+	// Process add actions from update descriptor.
+	for key, htlcUpdate := range update.AddHtlcs {
+		if _, exists := invoice.Htlcs[key]; exists {
+			return nil, fmt.Errorf("duplicate add of htlc %v", key)
+		}
+
+		// Force caller to supply htlc without custom records in a
+		// consistent way.
+		if htlcUpdate.CustomRecords == nil {
+			return nil, errors.New("nil custom records map")
+		}
+
+		htlc := &InvoiceHTLC{
+			Amt:           htlcUpdate.Amt,
+			MppTotalAmt:   htlcUpdate.MppTotalAmt,
+			Expiry:        htlcUpdate.Expiry,
+			AcceptHeight:  uint32(htlcUpdate.AcceptHeight),
+			AcceptTime:    now,
+			State:         HtlcStateAccepted,
+			CustomRecords: htlcUpdate.CustomRecords,
+		}
+
+		invoice.Htlcs[key] = htlc
+	}
+
+	// Align htlc states with invoice state and recalculate amount paid.
+	var (
+		amtPaid     lnwire.MilliSatoshi
+		cancelHtlcs = update.CancelHtlcs
+	)
+	for key, htlc := range invoice.Htlcs {
+		// Check whether this htlc needs to be canceled. If it does,
+		// update the htlc state to Canceled.
+		_, cancel := cancelHtlcs[key]
+		if cancel {
+			// Consistency check to verify that there is no overlap
+			// between the add and cancel sets.
+			if _, added := update.AddHtlcs[key]; added {
+				return nil, fmt.Errorf("added htlc %v canceled",
+					key)
 			}
 
-			htlc.State = HtlcStateCanceled
-			htlc.ResolveTime = now
-			invoice.AmtPaid -= htlc.Amt
+			err := cancelSingleHtlc(now, htlc, invoice.State)
+			if err != nil {
+				return nil, err
+			}
+
+			// Delete processed cancel action, so that we can check
+			// later that there are no actions left.
+			delete(cancelHtlcs, key)
 
 			continue
 		}
 
-		// Add new htlc paying to the invoice.
-		if ok {
-			return nil, fmt.Errorf("htlc %v already exists", key)
-		}
-		htlc = &InvoiceHTLC{
-			Amt:          htlcUpdate.Amt,
-			Expiry:       htlcUpdate.Expiry,
-			AcceptHeight: uint32(htlcUpdate.AcceptHeight),
-			AcceptTime:   now,
-		}
-		if preUpdateState == ContractSettled {
-			htlc.State = HtlcStateSettled
-			htlc.ResolveTime = now
-		} else {
-			htlc.State = HtlcStateAccepted
-		}
-
-		invoice.Htlcs[key] = htlc
-		invoice.AmtPaid += htlc.Amt
-	}
-
-	// If invoice moved to the settled state, update settle index and settle
-	// time.
-	if preUpdateState != invoice.Terms.State &&
-		invoice.Terms.State == ContractSettled {
-
-		if update.Preimage.Hash() != hash {
-			return nil, fmt.Errorf("preimage does not match")
-		}
-		invoice.Terms.PaymentPreimage = update.Preimage
-
-		// Settle all accepted htlcs.
-		for _, htlc := range invoice.Htlcs {
-			if htlc.State != HtlcStateAccepted {
-				continue
-			}
-
-			htlc.State = HtlcStateSettled
-			htlc.ResolveTime = now
-		}
-
-		err := setSettleFields(settleIndex, invoiceNum, &invoice, now)
+		// The invoice state may have changed and this could have
+		// implications for the states of the individual htlcs. Align
+		// the htlc state with the current invoice state.
+		err := updateHtlc(now, htlc, invoice.State)
 		if err != nil {
 			return nil, err
 		}
+
+		// Update the running amount paid to this invoice. We don't
+		// include accepted htlcs when the invoice is still open.
+		if invoice.State != ContractOpen &&
+			(htlc.State == HtlcStateAccepted ||
+				htlc.State == HtlcStateSettled) {
+
+			amtPaid += htlc.Amt
+		}
+	}
+	invoice.AmtPaid = amtPaid
+
+	// Verify that we didn't get an action for htlcs that are not present on
+	// the invoice.
+	if len(cancelHtlcs) > 0 {
+		return nil, errors.New("cancel action on non-existent htlc(s)")
 	}
 
+	// Reserialize and update invoice.
 	var buf bytes.Buffer
 	if err := serializeInvoice(&buf, &invoice); err != nil {
 		return nil, err
@@ -1295,7 +1621,125 @@ func (d *DB) updateInvoice(hash lntypes.Hash, invoices, settleIndex *bbolt.Bucke
 	return &invoice, nil
 }
 
-func setSettleFields(settleIndex *bbolt.Bucket, invoiceNum []byte,
+// updateInvoiceState validates and processes an invoice state update.
+func updateInvoiceState(invoice *Invoice, hash lntypes.Hash,
+	update InvoiceStateUpdateDesc) error {
+
+	// Returning to open is never allowed from any state.
+	if update.NewState == ContractOpen {
+		return ErrInvoiceCannotOpen
+	}
+
+	switch invoice.State {
+
+	// Once a contract is accepted, we can only transition to settled or
+	// canceled. Forbid transitioning back into this state. Otherwise this
+	// state is identical to ContractOpen, so we fallthrough to apply the
+	// same checks that we apply to open invoices.
+	case ContractAccepted:
+		if update.NewState == ContractAccepted {
+			return ErrInvoiceCannotAccept
+		}
+
+		fallthrough
+
+	// If a contract is open, permit a state transition to accepted, settled
+	// or canceled. The only restriction is on transitioning to settled
+	// where we ensure the preimage is valid.
+	case ContractOpen:
+		if update.NewState == ContractSettled {
+			// Validate preimage.
+			switch {
+			case update.Preimage != nil:
+				if update.Preimage.Hash() != hash {
+					return ErrInvoicePreimageMismatch
+				}
+				invoice.Terms.PaymentPreimage = update.Preimage
+
+			case invoice.Terms.PaymentPreimage == nil:
+				return errors.New("unknown preimage")
+			}
+		}
+
+	// Once settled, we are in a terminal state.
+	case ContractSettled:
+		return ErrInvoiceAlreadySettled
+
+	// Once canceled, we are in a terminal state.
+	case ContractCanceled:
+		return ErrInvoiceAlreadyCanceled
+
+	default:
+		return errors.New("unknown state transition")
+	}
+
+	invoice.State = update.NewState
+
+	return nil
+}
+
+// cancelSingleHtlc validates cancelation of a single htlc and update its state.
+func cancelSingleHtlc(resolveTime time.Time, htlc *InvoiceHTLC,
+	invState ContractState) error {
+
+	// It is only possible to cancel individual htlcs on an open invoice.
+	if invState != ContractOpen {
+		return fmt.Errorf("htlc canceled on invoice in "+
+			"state %v", invState)
+	}
+
+	// It is only possible if the htlc is still pending.
+	if htlc.State != HtlcStateAccepted {
+		return fmt.Errorf("htlc canceled in state %v",
+			htlc.State)
+	}
+
+	htlc.State = HtlcStateCanceled
+	htlc.ResolveTime = resolveTime
+
+	return nil
+}
+
+// updateHtlc aligns the state of an htlc with the given invoice state.
+func updateHtlc(resolveTime time.Time, htlc *InvoiceHTLC,
+	invState ContractState) error {
+
+	switch invState {
+
+	case ContractSettled:
+		if htlc.State == HtlcStateAccepted {
+			htlc.State = HtlcStateSettled
+			htlc.ResolveTime = resolveTime
+		}
+
+	case ContractCanceled:
+		switch htlc.State {
+
+		case HtlcStateAccepted:
+			htlc.State = HtlcStateCanceled
+			htlc.ResolveTime = resolveTime
+
+		case HtlcStateSettled:
+			return fmt.Errorf("cannot have a settled htlc with " +
+				"invoice in state canceled")
+		}
+
+	case ContractOpen, ContractAccepted:
+		if htlc.State == HtlcStateSettled {
+			return fmt.Errorf("cannot have a settled htlc with "+
+				"invoice in state %v", invState)
+		}
+
+	default:
+		return errors.New("unknown state transition")
+	}
+
+	return nil
+}
+
+// setSettleMetaFields updates the metadata associated with settlement of an
+// invoice.
+func setSettleMetaFields(settleIndex kvdb.RwBucket, invoiceNum []byte,
 	invoice *Invoice, now time.Time) error {
 
 	// Now that we know the invoice hasn't already been settled, we'll
@@ -1312,7 +1756,6 @@ func setSettleFields(settleIndex *bbolt.Bucket, invoiceNum []byte,
 		return err
 	}
 
-	invoice.Terms.State = ContractSettled
 	invoice.SettleDate = now
 	invoice.SettleIndex = nextSettleSeqNo
 

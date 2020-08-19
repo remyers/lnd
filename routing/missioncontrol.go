@@ -4,8 +4,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/bbolt"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/route"
 )
@@ -50,6 +50,11 @@ const (
 	// DefaultAprioriWeight is the default a priori weight. See
 	// MissionControlConfig for further explanation.
 	DefaultAprioriWeight = 0.5
+
+	// DefaultMinFailureRelaxInterval is the default minimum time that must
+	// have passed since the previously recorded failure before the failure
+	// amount may be raised.
+	DefaultMinFailureRelaxInterval = time.Minute
 )
 
 // NodeResults contains previous results from a node to its peers.
@@ -65,15 +70,9 @@ type NodeResults map[route.Vertex]TimedPairResult
 // since the last failure is used to estimate a success probability that is fed
 // into the path finding process for subsequent payment attempts.
 type MissionControl struct {
-	// lastPairResult tracks the last payment result (on a pair basis) for
-	// each transited node. This is a multi-layer map that allows us to look
-	// up the failure history of all connected channels (node pairs) for a
-	// particular node.
-	lastPairResult map[route.Vertex]NodeResults
-
-	// lastSecondChance tracks the last time a second chance was granted for
-	// a directed node pair.
-	lastSecondChance map[DirectedNodePair]time.Time
+	// state is the internal mission control state that is input for
+	// probability estimation.
+	state *missionControlState
 
 	// now is expected to return the current time. It is supplied as an
 	// external function to enable deterministic unit tests.
@@ -119,33 +118,33 @@ type MissionControlConfig struct {
 	// results, unless there are none available.
 	AprioriWeight float64
 
+	// MinFailureRelaxInterval is the minimum time that must have passed
+	// since the previously recorded failure before the failure amount may
+	// be raised.
+	MinFailureRelaxInterval time.Duration
+
 	// SelfNode is our own pubkey.
 	SelfNode route.Vertex
 }
 
 // TimedPairResult describes a timestamped pair result.
 type TimedPairResult struct {
-	// timestamp is the time when this result was obtained.
-	Timestamp time.Time
+	// FailTime is the time of the last failure.
+	FailTime time.Time
 
-	// minPenalizeAmt is the minimum amount for which a penalty should be
-	// applied based on this result. Only applies to fail results.
-	MinPenalizeAmt lnwire.MilliSatoshi
+	// FailAmt is the amount of the last failure. This amount may be pushed
+	// up if a later success is higher than the last failed amount.
+	FailAmt lnwire.MilliSatoshi
 
-	// success indicates whether the payment attempt was successful through
-	// this pair.
-	Success bool
-}
+	// SuccessTime is the time of the last success.
+	SuccessTime time.Time
 
-// newTimedPairResult wraps a pair result with a timestamp.
-func newTimedPairResult(timestamp time.Time,
-	result pairResult) TimedPairResult {
-
-	return TimedPairResult{
-		Timestamp:      timestamp,
-		MinPenalizeAmt: result.minPenalizeAmt,
-		Success:        result.success,
-	}
+	// SuccessAmt is the highest amount that successfully forwarded. This
+	// isn't necessarily the last success amount. The value of this field
+	// may also be pushed down if a later failure is lower than the highest
+	// success amount. Because of this, SuccessAmt may not match
+	// SuccessTime.
+	SuccessAmt lnwire.MilliSatoshi
 }
 
 // MissionControlSnapshot contains a snapshot of the current state of mission
@@ -178,7 +177,7 @@ type paymentResult struct {
 }
 
 // NewMissionControl returns a new instance of missionControl.
-func NewMissionControl(db *bbolt.DB, cfg *MissionControlConfig) (
+func NewMissionControl(db kvdb.Backend, cfg *MissionControlConfig) (
 	*MissionControl, error) {
 
 	log.Debugf("Instantiating mission control with config: "+
@@ -199,12 +198,11 @@ func NewMissionControl(db *bbolt.DB, cfg *MissionControlConfig) (
 	}
 
 	mc := &MissionControl{
-		lastPairResult:   make(map[route.Vertex]NodeResults),
-		lastSecondChance: make(map[DirectedNodePair]time.Time),
-		now:              time.Now,
-		cfg:              cfg,
-		store:            store,
-		estimator:        estimator,
+		state:     newMissionControlState(cfg.MinFailureRelaxInterval),
+		now:       time.Now,
+		cfg:       cfg,
+		store:     store,
+		estimator: estimator,
 	}
 
 	if err := mc.init(); err != nil {
@@ -230,7 +228,7 @@ func (m *MissionControl) init() error {
 	}
 
 	log.Debugf("Mission control state reconstruction finished: "+
-		"n=%v, time=%v", len(results), time.Now().Sub(start))
+		"n=%v, time=%v", len(results), time.Since(start))
 
 	return nil
 }
@@ -245,8 +243,7 @@ func (m *MissionControl) ResetHistory() error {
 		return err
 	}
 
-	m.lastPairResult = make(map[route.Vertex]NodeResults)
-	m.lastSecondChance = make(map[DirectedNodePair]time.Time)
+	m.state.resetHistory()
 
 	log.Debugf("Mission control history cleared")
 
@@ -262,7 +259,7 @@ func (m *MissionControl) GetProbability(fromNode, toNode route.Vertex,
 	defer m.Unlock()
 
 	now := m.now()
-	results := m.lastPairResult[fromNode]
+	results, _ := m.state.getLastPairResult(fromNode)
 
 	// Use a distinct probability estimation function for local channels.
 	if fromNode == m.cfg.SelfNode {
@@ -272,95 +269,15 @@ func (m *MissionControl) GetProbability(fromNode, toNode route.Vertex,
 	return m.estimator.getPairProbability(now, results, toNode, amt)
 }
 
-// setLastPairResult stores a result for a node pair.
-func (m *MissionControl) setLastPairResult(fromNode,
-	toNode route.Vertex, result TimedPairResult) {
-
-	nodePairs, ok := m.lastPairResult[fromNode]
-	if !ok {
-		nodePairs = make(NodeResults)
-		m.lastPairResult[fromNode] = nodePairs
-	}
-
-	nodePairs[toNode] = result
-}
-
-// setAllFail stores a fail result for all known connection of the given node.
-func (m *MissionControl) setAllFail(fromNode route.Vertex,
-	timestamp time.Time) {
-
-	nodePairs, ok := m.lastPairResult[fromNode]
-	if !ok {
-		return
-	}
-
-	for connection := range nodePairs {
-		nodePairs[connection] = newTimedPairResult(
-			timestamp, failPairResult(0),
-		)
-	}
-}
-
-// requestSecondChance checks whether the node fromNode can have a second chance
-// at providing a channel update for its channel with toNode.
-func (m *MissionControl) requestSecondChance(timestamp time.Time,
-	fromNode, toNode route.Vertex) bool {
-
-	// Look up previous second chance time.
-	pair := DirectedNodePair{
-		From: fromNode,
-		To:   toNode,
-	}
-	lastSecondChance, ok := m.lastSecondChance[pair]
-
-	// If the channel hasn't already be given a second chance or its last
-	// second chance was long ago, we give it another chance.
-	if !ok || timestamp.Sub(lastSecondChance) > minSecondChanceInterval {
-		m.lastSecondChance[pair] = timestamp
-
-		log.Debugf("Second chance granted for %v->%v", fromNode, toNode)
-
-		return true
-	}
-
-	// Otherwise penalize the channel, because we don't allow channel
-	// updates that are that frequent. This is to prevent nodes from keeping
-	// us busy by continuously sending new channel updates.
-	log.Debugf("Second chance denied for %v->%v, remaining interval: %v",
-		fromNode, toNode, timestamp.Sub(lastSecondChance))
-
-	return false
-}
-
 // GetHistorySnapshot takes a snapshot from the current mission control state
 // and actual probability estimates.
 func (m *MissionControl) GetHistorySnapshot() *MissionControlSnapshot {
 	m.Lock()
 	defer m.Unlock()
 
-	log.Debugf("Requesting history snapshot from mission control: "+
-		"pair_result_count=%v", len(m.lastPairResult))
+	log.Debugf("Requesting history snapshot from mission control")
 
-	pairs := make([]MissionControlPairSnapshot, 0, len(m.lastPairResult))
-
-	for fromNode, fromPairs := range m.lastPairResult {
-		for toNode, result := range fromPairs {
-			pair := NewDirectedNodePair(fromNode, toNode)
-
-			pairSnapshot := MissionControlPairSnapshot{
-				Pair:            pair,
-				TimedPairResult: result,
-			}
-
-			pairs = append(pairs, pairSnapshot)
-		}
-	}
-
-	snapshot := MissionControlSnapshot{
-		Pairs: pairs,
-	}
-
-	return &snapshot
+	return m.state.getSnapshot()
 }
 
 // GetPairHistorySnapshot returns the stored history for a given node pair.
@@ -370,7 +287,7 @@ func (m *MissionControl) GetPairHistorySnapshot(
 	m.Lock()
 	defer m.Unlock()
 
-	results, ok := m.lastPairResult[fromNode]
+	results, ok := m.state.getLastPairResult(fromNode)
 	if !ok {
 		return TimedPairResult{}
 	}
@@ -459,7 +376,7 @@ func (m *MissionControl) applyPaymentResult(
 	defer m.Unlock()
 
 	if i.policyFailure != nil {
-		if m.requestSecondChance(
+		if m.state.requestSecondChance(
 			result.timeReply,
 			i.policyFailure.From, i.policyFailure.To,
 		) {
@@ -488,25 +405,24 @@ func (m *MissionControl) applyPaymentResult(
 		log.Debugf("Reporting node failure to Mission Control: "+
 			"node=%v", *i.nodeFailure)
 
-		m.setAllFail(*i.nodeFailure, result.timeReply)
+		m.state.setAllFail(*i.nodeFailure, result.timeReply)
 	}
 
 	for pair, pairResult := range i.pairResults {
+		pairResult := pairResult
+
 		if pairResult.success {
 			log.Debugf("Reporting pair success to Mission "+
-				"Control: pair=%v", pair)
+				"Control: pair=%v, amt=%v",
+				pair, pairResult.amt)
 		} else {
 			log.Debugf("Reporting pair failure to Mission "+
-				"Control: pair=%v, minPenalizeAmt=%v",
-				pair, pairResult.minPenalizeAmt)
+				"Control: pair=%v, amt=%v",
+				pair, pairResult.amt)
 		}
 
-		m.setLastPairResult(
-			pair.From, pair.To,
-			newTimedPairResult(
-				result.timeReply,
-				pairResult,
-			),
+		m.state.setLastPairResult(
+			pair.From, pair.To, result.timeReply, &pairResult,
 		)
 	}
 

@@ -29,4 +29,26 @@ var defaultSetDesc = setDesc{
 		SetNodeAnn:      {}, // N
 		SetLegacyGlobal: {},
 	},
+	lnwire.UpfrontShutdownScriptOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.PaymentAddrOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+		SetInvoice: {}, // 9
+	},
+	lnwire.MPPOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+		SetInvoice: {}, // 9
+	},
+	lnwire.AnchorsOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
+	lnwire.WumboChannelsOptional: {
+		SetInit:    {}, // I
+		SetNodeAnn: {}, // N
+	},
 }

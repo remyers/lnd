@@ -141,7 +141,14 @@ func (t *backupTask) bindSession(session *wtdb.ClientSessionBody) error {
 	// Next, add the contribution from the inputs that are present on this
 	// breach transaction.
 	if t.toLocalInput != nil {
-		weightEstimate.AddWitnessInput(input.ToLocalPenaltyWitnessSize)
+		// An older ToLocalPenaltyWitnessSize constant used to
+		// underestimate the size by one byte. The diferrence in weight
+		// can cause different output values on the sweep transaction,
+		// so we mimic the original bug and create signatures using the
+		// original weight estimate.
+		weightEstimate.AddWitnessInput(
+			input.ToLocalPenaltyWitnessSize - 1,
+		)
 	}
 	if t.toRemoteInput != nil {
 		weightEstimate.AddWitnessInput(input.P2WKHWitnessSize)
@@ -189,7 +196,7 @@ func (t *backupTask) craftSessionPayload(
 	justiceKit := &blob.JusticeKit{
 		SweepAddress:     t.sweepPkScript,
 		RevocationPubKey: toBlobPubKey(keyRing.RevocationKey),
-		LocalDelayPubKey: toBlobPubKey(keyRing.DelayKey),
+		LocalDelayPubKey: toBlobPubKey(keyRing.ToLocalKey),
 		CSVDelay:         t.breachInfo.RemoteDelay,
 	}
 
@@ -199,7 +206,7 @@ func (t *backupTask) craftSessionPayload(
 	// output to spend from.
 	if t.toRemoteInput != nil {
 		justiceKit.CommitToRemotePubKey = toBlobPubKey(
-			keyRing.NoDelayKey,
+			keyRing.ToRemoteKey,
 		)
 	}
 

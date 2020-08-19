@@ -1,5 +1,3 @@
-// +build routerrpc
-
 package main
 
 import (
@@ -88,7 +86,7 @@ func buildRoute(ctx *cli.Context) error {
 		return err
 	}
 
-	printJSON(route)
+	printRespJSON(route)
 
 	return nil
 }

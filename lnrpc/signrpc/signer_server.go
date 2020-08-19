@@ -11,12 +11,14 @@ import (
 	"path/filepath"
 
 	"github.com/btcsuite/btcd/btcec"
+	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
+	"github.com/grpc-ecosystem/grpc-gateway/runtime"
 	"github.com/lightningnetwork/lnd/input"
 	"github.com/lightningnetwork/lnd/keychain"
 	"github.com/lightningnetwork/lnd/lnrpc"
-
+	"github.com/lightningnetwork/lnd/lnwire"
 	"google.golang.org/grpc"
 	"gopkg.in/macaroon-bakery.v2/bakery"
 )
@@ -37,6 +39,10 @@ var (
 			Entity: "signer",
 			Action: "generate",
 		},
+		{
+			Entity: "signer",
+			Action: "read",
+		},
 	}
 
 	// macPermissions maps RPC calls to the permissions they require.
@@ -46,6 +52,18 @@ var (
 			Action: "generate",
 		}},
 		"/signrpc.Signer/ComputeInputScript": {{
+			Entity: "signer",
+			Action: "generate",
+		}},
+		"/signrpc.Signer/SignMessage": {{
+			Entity: "signer",
+			Action: "generate",
+		}},
+		"/signrpc.Signer/VerifyMessage": {{
+			Entity: "signer",
+			Action: "read",
+		}},
+		"/signrpc.Signer/DeriveSharedKey": {{
 			Entity: "signer",
 			Action: "generate",
 		}},
@@ -157,6 +175,28 @@ func (s *Server) RegisterWithRootServer(grpcServer *grpc.Server) error {
 	return nil
 }
 
+// RegisterWithRestServer will be called by the root REST mux to direct a sub
+// RPC server to register itself with the main REST mux server. Until this is
+// called, each sub-server won't be able to have requests routed towards it.
+//
+// NOTE: This is part of the lnrpc.SubServer interface.
+func (s *Server) RegisterWithRestServer(ctx context.Context,
+	mux *runtime.ServeMux, dest string, opts []grpc.DialOption) error {
+
+	// We make sure that we register it with the main REST server to ensure
+	// all our methods are routed properly.
+	err := RegisterSignerHandlerFromEndpoint(ctx, mux, dest, opts)
+	if err != nil {
+		log.Errorf("Could not register Signer REST server "+
+			"with root REST server: %v", err)
+		return err
+	}
+
+	log.Debugf("Signer REST server successfully registered with " +
+		"root REST server")
+	return nil
+}
+
 // SignOutputRaw generates a signature for the passed transaction according to
 // the data within the passed SignReq. If we're unable to find the keys that
 // correspond to the KeyLocators in the SignReq then we'll return an error.
@@ -202,17 +242,17 @@ func (s *Server) SignOutputRaw(ctx context.Context, in *SignReq) (*SignResp, err
 		keyDesc := signDesc.KeyDesc
 
 		// The caller can either specify the key using the raw pubkey,
-		// or the description of the key. Below we'll feel out the
-		// oneof field to decide which one we will attempt to parse.
+		// or the description of the key. We'll still attempt to parse
+		// both if both were provided however, to ensure the underlying
+		// SignOutputRaw has as much information as possible.
 		var (
 			targetPubKey *btcec.PublicKey
 			keyLoc       keychain.KeyLocator
 		)
-		switch {
 
 		// If this method doesn't return nil, then we know that user is
 		// attempting to include a raw serialized pub key.
-		case keyDesc.GetRawKeyBytes() != nil:
+		if keyDesc.GetRawKeyBytes() != nil {
 			rawKeyBytes := keyDesc.GetRawKeyBytes()
 
 			switch {
@@ -235,10 +275,11 @@ func (s *Server) SignOutputRaw(ctx context.Context, in *SignReq) (*SignResp, err
 						"parse pubkey: %v", err)
 				}
 			}
+		}
 
-		// Similarly, if they specified a key locator, then we'll use
-		// that instead.
-		case keyDesc.GetKeyLoc() != nil:
+		// Similarly, if they specified a key locator, then we'll parse
+		// that as well.
+		if keyDesc.GetKeyLoc() != nil {
 			protoLoc := keyDesc.GetKeyLoc()
 			keyLoc = keychain.KeyLocator{
 				Family: keychain.KeyFamily(
@@ -303,7 +344,7 @@ func (s *Server) SignOutputRaw(ctx context.Context, in *SignReq) (*SignResp, err
 			return nil, err
 		}
 
-		resp.RawSigs[i] = sig
+		resp.RawSigs[i] = sig.Serialize()
 	}
 
 	return resp, nil
@@ -355,8 +396,9 @@ func (s *Server) ComputeInputScript(ctx context.Context,
 				Value:    signDesc.Output.Value,
 				PkScript: signDesc.Output.PkScript,
 			},
-			HashType:  txscript.SigHashType(signDesc.Sighash),
-			SigHashes: sigHashCache,
+			HashType:   txscript.SigHashType(signDesc.Sighash),
+			SigHashes:  sigHashCache,
+			InputIndex: int(signDesc.InputIndex),
 		})
 	}
 
@@ -382,4 +424,126 @@ func (s *Server) ComputeInputScript(ctx context.Context,
 	}
 
 	return resp, nil
+}
+
+// SignMessage signs a message with the key specified in the key locator. The
+// returned signature is fixed-size LN wire format encoded.
+func (s *Server) SignMessage(ctx context.Context,
+	in *SignMessageReq) (*SignMessageResp, error) {
+
+	if in.Msg == nil {
+		return nil, fmt.Errorf("a message to sign MUST be passed in")
+	}
+	if in.KeyLoc == nil {
+		return nil, fmt.Errorf("a key locator MUST be passed in")
+	}
+
+	// Describe the private key we'll be using for signing.
+	keyDescriptor := keychain.KeyDescriptor{
+		KeyLocator: keychain.KeyLocator{
+			Family: keychain.KeyFamily(in.KeyLoc.KeyFamily),
+			Index:  uint32(in.KeyLoc.KeyIndex),
+		},
+	}
+
+	// The signature is over the sha256 hash of the message.
+	var digest [32]byte
+	copy(digest[:], chainhash.HashB(in.Msg))
+
+	// Create the raw ECDSA signature first and convert it to the final wire
+	// format after.
+	sig, err := s.cfg.KeyRing.SignDigest(keyDescriptor, digest)
+	if err != nil {
+		return nil, fmt.Errorf("can't sign the hash: %v", err)
+	}
+	wireSig, err := lnwire.NewSigFromSignature(sig)
+	if err != nil {
+		return nil, fmt.Errorf("can't convert to wire format: %v", err)
+	}
+	return &SignMessageResp{
+		Signature: wireSig.ToSignatureBytes(),
+	}, nil
+}
+
+// VerifyMessage verifies a signature over a message using the public key
+// provided. The signature must be fixed-size LN wire format encoded.
+func (s *Server) VerifyMessage(ctx context.Context,
+	in *VerifyMessageReq) (*VerifyMessageResp, error) {
+
+	if in.Msg == nil {
+		return nil, fmt.Errorf("a message to verify MUST be passed in")
+	}
+	if in.Signature == nil {
+		return nil, fmt.Errorf("a signature to verify MUST be passed " +
+			"in")
+	}
+	if in.Pubkey == nil {
+		return nil, fmt.Errorf("a pubkey to verify MUST be passed in")
+	}
+	pubkey, err := btcec.ParsePubKey(in.Pubkey, btcec.S256())
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse pubkey: %v", err)
+	}
+
+	// The signature must be fixed-size LN wire format encoded.
+	wireSig, err := lnwire.NewSigFromRawSignature(in.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode signature: %v", err)
+	}
+	sig, err := wireSig.ToSignature()
+	if err != nil {
+		return nil, fmt.Errorf("failed to convert from wire format: %v",
+			err)
+	}
+
+	// The signature is over the sha256 hash of the message.
+	digest := chainhash.HashB(in.Msg)
+	valid := sig.Verify(digest, pubkey)
+	return &VerifyMessageResp{
+		Valid: valid,
+	}, nil
+}
+
+// DeriveSharedKey returns a shared secret key by performing Diffie-Hellman key
+// derivation between the ephemeral public key in the request and the node's
+// key specified in the key_loc parameter (or the node's identity private key
+// if no key locator is specified):
+//     P_shared = privKeyNode * ephemeralPubkey
+// The resulting shared public key is serialized in the compressed format and
+// hashed with sha256, resulting in the final key length of 256bit.
+func (s *Server) DeriveSharedKey(_ context.Context, in *SharedKeyRequest) (
+	*SharedKeyResponse, error) {
+
+	if len(in.EphemeralPubkey) != 33 {
+		return nil, fmt.Errorf("ephemeral pubkey must be " +
+			"serialized in compressed format")
+	}
+	ephemeralPubkey, err := btcec.ParsePubKey(
+		in.EphemeralPubkey, btcec.S256(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse pubkey: %v", err)
+	}
+
+	// By default, use the node identity private key.
+	locator := keychain.KeyLocator{
+		Family: keychain.KeyFamilyNodeKey,
+		Index:  0,
+	}
+	if in.KeyLoc != nil {
+		locator.Family = keychain.KeyFamily(in.KeyLoc.KeyFamily)
+		locator.Index = uint32(in.KeyLoc.KeyIndex)
+	}
+
+	// Derive the shared key using ECDH and hashing the serialized
+	// compressed shared point.
+	keyDescriptor := keychain.KeyDescriptor{KeyLocator: locator}
+	sharedKeyHash, err := s.cfg.KeyRing.ECDH(keyDescriptor, ephemeralPubkey)
+	if err != nil {
+		err := fmt.Errorf("unable to derive shared key: %v", err)
+		log.Error(err)
+		return nil, err
+	}
+
+	return &SharedKeyResponse{SharedKey: sharedKeyHash[:]}, nil
 }

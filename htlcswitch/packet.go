@@ -4,6 +4,7 @@ import (
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/lnwire"
+	"github.com/lightningnetwork/lnd/record"
 )
 
 // htlcPacket is a wrapper around htlc lnwire update, which adds additional
@@ -54,6 +55,11 @@ type htlcPacket struct {
 	// encrypted with any shared secret.
 	localFailure bool
 
+	// linkFailure is non-nil for htlcs that fail at our node. This may
+	// occur for our own payments which fail on the outgoing link,
+	// or for forwards which fail in the switch or on the outgoing link.
+	linkFailure *LinkError
+
 	// convertedError is set to true if this is an HTLC fail that was
 	// created using an UpdateFailMalformedHTLC from the remote party. If
 	// this is true, then when forwarding this failure packet, we'll need
@@ -86,6 +92,10 @@ type htlcPacket struct {
 	// will be extraced from the hop payload recevived by the incoming
 	// link.
 	outgoingTimeout uint32
+
+	// customRecords are user-defined records in the custom type range that
+	// were included in the payload.
+	customRecords record.CustomSet
 }
 
 // inKey returns the circuit key used to identify the incoming htlc.

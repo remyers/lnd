@@ -7,10 +7,9 @@ import (
 	"io"
 	"sort"
 
-	"github.com/coreos/bbolt"
+	"github.com/lightningnetwork/lnd/channeldb/kvdb"
 	"github.com/lightningnetwork/lnd/lntypes"
 	"github.com/lightningnetwork/lnd/lnwire"
-	"github.com/lightningnetwork/lnd/routing/route"
 )
 
 var (
@@ -77,8 +76,8 @@ func (db *DB) addPayment(payment *outgoingPayment) error {
 	}
 	paymentBytes := b.Bytes()
 
-	return db.Batch(func(tx *bbolt.Tx) error {
-		payments, err := tx.CreateBucketIfNotExists(paymentBucket)
+	return kvdb.Update(db, func(tx kvdb.RwTx) error {
+		payments, err := tx.CreateTopLevelBucket(paymentBucket)
 		if err != nil {
 			return err
 		}
@@ -105,8 +104,8 @@ func (db *DB) addPayment(payment *outgoingPayment) error {
 func (db *DB) fetchAllPayments() ([]*outgoingPayment, error) {
 	var payments []*outgoingPayment
 
-	err := db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(paymentBucket)
+	err := kvdb.View(db, func(tx kvdb.RTx) error {
+		bucket := tx.ReadBucket(paymentBucket)
 		if bucket == nil {
 			return ErrNoPaymentsCreated
 		}
@@ -141,7 +140,7 @@ func (db *DB) fetchAllPayments() ([]*outgoingPayment, error) {
 // NOTE: Deprecated. Kept around for migration purposes.
 func (db *DB) fetchPaymentStatus(paymentHash [32]byte) (PaymentStatus, error) {
 	var paymentStatus = StatusUnknown
-	err := db.View(func(tx *bbolt.Tx) error {
+	err := kvdb.View(db, func(tx kvdb.RTx) error {
 		var err error
 		paymentStatus, err = fetchPaymentStatusTx(tx, paymentHash)
 		return err
@@ -159,11 +158,11 @@ func (db *DB) fetchPaymentStatus(paymentHash [32]byte) (PaymentStatus, error) {
 // can be composed into other atomic operations.
 //
 // NOTE: Deprecated. Kept around for migration purposes.
-func fetchPaymentStatusTx(tx *bbolt.Tx, paymentHash [32]byte) (PaymentStatus, error) {
+func fetchPaymentStatusTx(tx kvdb.RTx, paymentHash [32]byte) (PaymentStatus, error) {
 	// The default status for all payments that aren't recorded in database.
 	var paymentStatus = StatusUnknown
 
-	bucket := tx.Bucket(paymentStatusBucket)
+	bucket := tx.ReadBucket(paymentStatusBucket)
 	if bucket == nil {
 		return paymentStatus, nil
 	}
@@ -274,7 +273,7 @@ func serializePaymentAttemptInfoMigration9(w io.Writer, a *PaymentAttemptInfo) e
 	return nil
 }
 
-func serializeHopMigration9(w io.Writer, h *route.Hop) error {
+func serializeHopMigration9(w io.Writer, h *Hop) error {
 	if err := WriteElements(w,
 		h.PubKeyBytes[:], h.ChannelID, h.OutgoingTimeLock,
 		h.AmtToForward,
@@ -285,7 +284,7 @@ func serializeHopMigration9(w io.Writer, h *route.Hop) error {
 	return nil
 }
 
-func serializeRouteMigration9(w io.Writer, r route.Route) error {
+func serializeRouteMigration9(w io.Writer, r Route) error {
 	if err := WriteElements(w,
 		r.TotalTimeLock, r.TotalAmount, r.SourcePubKey[:],
 	); err != nil {
@@ -318,8 +317,8 @@ func deserializePaymentAttemptInfoMigration9(r io.Reader) (*PaymentAttemptInfo, 
 	return a, nil
 }
 
-func deserializeRouteMigration9(r io.Reader) (route.Route, error) {
-	rt := route.Route{}
+func deserializeRouteMigration9(r io.Reader) (Route, error) {
+	rt := Route{}
 	if err := ReadElements(r,
 		&rt.TotalTimeLock, &rt.TotalAmount,
 	); err != nil {
@@ -337,7 +336,7 @@ func deserializeRouteMigration9(r io.Reader) (route.Route, error) {
 		return rt, err
 	}
 
-	var hops []*route.Hop
+	var hops []*Hop
 	for i := uint32(0); i < numHops; i++ {
 		hop, err := deserializeHopMigration9(r)
 		if err != nil {
@@ -350,8 +349,8 @@ func deserializeRouteMigration9(r io.Reader) (route.Route, error) {
 	return rt, nil
 }
 
-func deserializeHopMigration9(r io.Reader) (*route.Hop, error) {
-	h := &route.Hop{}
+func deserializeHopMigration9(r io.Reader) (*Hop, error) {
+	h := &Hop{}
 
 	var pub []byte
 	if err := ReadElements(r, &pub); err != nil {
@@ -376,14 +375,14 @@ func deserializeHopMigration9(r io.Reader) (*route.Hop, error) {
 func (db *DB) fetchPaymentsMigration9() ([]*Payment, error) {
 	var payments []*Payment
 
-	err := db.View(func(tx *bbolt.Tx) error {
-		paymentsBucket := tx.Bucket(paymentsRootBucket)
+	err := kvdb.View(db, func(tx kvdb.RTx) error {
+		paymentsBucket := tx.ReadBucket(paymentsRootBucket)
 		if paymentsBucket == nil {
 			return nil
 		}
 
 		return paymentsBucket.ForEach(func(k, v []byte) error {
-			bucket := paymentsBucket.Bucket(k)
+			bucket := paymentsBucket.NestedReadBucket(k)
 			if bucket == nil {
 				// We only expect sub-buckets to be found in
 				// this top-level bucket.
@@ -402,13 +401,13 @@ func (db *DB) fetchPaymentsMigration9() ([]*Payment, error) {
 			// payment has was possible. These will be found in a
 			// sub-bucket indexed by their sequence number if
 			// available.
-			dup := bucket.Bucket(paymentDuplicateBucket)
+			dup := bucket.NestedReadBucket(paymentDuplicateBucket)
 			if dup == nil {
 				return nil
 			}
 
 			return dup.ForEach(func(k, v []byte) error {
-				subBucket := dup.Bucket(k)
+				subBucket := dup.NestedReadBucket(k)
 				if subBucket == nil {
 					// We one bucket for each duplicate to
 					// be found.
@@ -438,7 +437,7 @@ func (db *DB) fetchPaymentsMigration9() ([]*Payment, error) {
 	return payments, nil
 }
 
-func fetchPaymentMigration9(bucket *bbolt.Bucket) (*Payment, error) {
+func fetchPaymentMigration9(bucket kvdb.RBucket) (*Payment, error) {
 	var (
 		err error
 		p   = &Payment{}

@@ -21,6 +21,7 @@ import (
 	"github.com/go-errors/errors"
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/clock"
 	"github.com/lightningnetwork/lnd/contractcourt"
 	"github.com/lightningnetwork/lnd/htlcswitch/hop"
 	"github.com/lightningnetwork/lnd/input"
@@ -175,6 +176,9 @@ func initSwitchWithDB(startingHeight uint32, db *channeldb.DB) (*Switch, error) 
 		FwdEventTicker: ticker.NewForce(DefaultFwdEventInterval),
 		LogEventTicker: ticker.NewForce(DefaultLogInterval),
 		AckEventTicker: ticker.NewForce(DefaultAckInterval),
+		HtlcNotifier:   &mockHTLCNotifier{},
+		Clock:          clock.NewDefaultClock(),
+		HTLCExpiry:     time.Hour,
 	}
 
 	return New(cfg, startingHeight)
@@ -399,10 +403,7 @@ func (o *mockDeobfuscator) DecryptError(reason lnwire.OpaqueReason) (*Forwarding
 		return nil, err
 	}
 
-	return &ForwardingError{
-		FailureSourceIdx: 1,
-		FailureMessage:   failure,
-	}, nil
+	return NewForwardingError(failure, 1), nil
 }
 
 var _ ErrorDecrypter = (*mockDeobfuscator)(nil)
@@ -603,9 +604,7 @@ func (s *mockServer) AddNewChannel(channel *channeldb.OpenChannel,
 	return nil
 }
 
-func (s *mockServer) WipeChannel(*wire.OutPoint) error {
-	return nil
-}
+func (s *mockServer) WipeChannel(*wire.OutPoint) {}
 
 func (s *mockServer) LocalFeatures() *lnwire.FeatureVector {
 	return nil
@@ -647,9 +646,9 @@ type mockChannelLink struct {
 
 	htlcID uint64
 
-	checkHtlcTransitResult lnwire.FailureMessage
+	checkHtlcTransitResult *LinkError
 
-	checkHtlcForwardResult lnwire.FailureMessage
+	checkHtlcForwardResult *LinkError
 }
 
 // completeCircuit is a helper method for adding the finalized payment circuit
@@ -703,20 +702,25 @@ func (f *mockChannelLink) HandleSwitchPacket(pkt *htlcPacket) error {
 	return nil
 }
 
+func (f *mockChannelLink) HandleLocalAddPacket(pkt *htlcPacket) error {
+	_ = f.mailBox.AddPacket(pkt)
+	return nil
+}
+
 func (f *mockChannelLink) HandleChannelUpdate(lnwire.Message) {
 }
 
 func (f *mockChannelLink) UpdateForwardingPolicy(_ ForwardingPolicy) {
 }
 func (f *mockChannelLink) CheckHtlcForward([32]byte, lnwire.MilliSatoshi,
-	lnwire.MilliSatoshi, uint32, uint32, uint32) lnwire.FailureMessage {
+	lnwire.MilliSatoshi, uint32, uint32, uint32) *LinkError {
 
 	return f.checkHtlcForwardResult
 }
 
 func (f *mockChannelLink) CheckHtlcTransit(payHash [32]byte,
 	amt lnwire.MilliSatoshi, timeout uint32,
-	heightNow uint32) lnwire.FailureMessage {
+	heightNow uint32) *LinkError {
 
 	return f.checkHtlcTransitResult
 }
@@ -790,9 +794,13 @@ func newMockRegistry(minDelta uint32) *mockInvoiceRegistry {
 		panic(err)
 	}
 
-	finalCltvRejectDelta := int32(5)
-
-	registry := invoices.NewRegistry(cdb, finalCltvRejectDelta)
+	registry := invoices.NewRegistry(
+		cdb,
+		invoices.NewInvoiceExpiryWatcher(clock.NewDefaultClock()),
+		&invoices.RegistryConfig{
+			FinalCltvRejectDelta: 5,
+		},
+	)
 	registry.Start()
 
 	return &mockInvoiceRegistry{
@@ -814,7 +822,7 @@ func (i *mockInvoiceRegistry) SettleHodlInvoice(preimage lntypes.Preimage) error
 func (i *mockInvoiceRegistry) NotifyExitHopHtlc(rhash lntypes.Hash,
 	amt lnwire.MilliSatoshi, expiry uint32, currentHeight int32,
 	circuitKey channeldb.CircuitKey, hodlChan chan<- interface{},
-	payload invoices.Payload) (*invoices.HodlEvent, error) {
+	payload invoices.Payload) (invoices.HtlcResolution, error) {
 
 	event, err := i.registry.NotifyExitHopHtlc(
 		rhash, amt, expiry, currentHeight, circuitKey, hodlChan,
@@ -851,7 +859,9 @@ type mockSigner struct {
 	key *btcec.PrivateKey
 }
 
-func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *input.SignDescriptor) ([]byte, error) {
+func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx,
+	signDesc *input.SignDescriptor) (input.Signature, error) {
+
 	amt := signDesc.Output.Value
 	witnessScript := signDesc.WitnessScript
 	privKey := m.key
@@ -876,7 +886,7 @@ func (m *mockSigner) SignOutputRaw(tx *wire.MsgTx, signDesc *input.SignDescripto
 		return nil, err
 	}
 
-	return sig[:len(sig)-1], nil
+	return btcec.ParseDERSignature(sig[:len(sig)-1], btcec.S256())
 }
 func (m *mockSigner) ComputeInputScript(tx *wire.MsgTx, signDesc *input.SignDescriptor) (*input.Script, error) {
 
@@ -924,6 +934,10 @@ func (m *mockNotifier) RegisterBlockEpochNtfn(
 
 func (m *mockNotifier) Start() error {
 	return nil
+}
+
+func (m *mockNotifier) Started() bool {
+	return true
 }
 
 func (m *mockNotifier) Stop() error {
@@ -1006,4 +1020,23 @@ func (m *mockOnionErrorDecryptor) DecryptError(encryptedData []byte) (
 		SenderIdx: m.sourceIdx,
 		Message:   m.message,
 	}, m.err
+}
+
+var _ htlcNotifier = (*mockHTLCNotifier)(nil)
+
+type mockHTLCNotifier struct{}
+
+func (h *mockHTLCNotifier) NotifyForwardingEvent(key HtlcKey, info HtlcInfo,
+	eventType HtlcEventType) {
+}
+
+func (h *mockHTLCNotifier) NotifyLinkFailEvent(key HtlcKey, info HtlcInfo,
+	eventType HtlcEventType, linkErr *LinkError, incoming bool) {
+}
+
+func (h *mockHTLCNotifier) NotifyForwardingFailEvent(key HtlcKey,
+	eventType HtlcEventType) {
+}
+
+func (h *mockHTLCNotifier) NotifySettleEvent(key HtlcKey, eventType HtlcEventType) {
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/btcsuite/btcutil"
@@ -80,7 +81,14 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		// present itself when we crash before processRemoteAdds in the
 		// link has ran.
 		h.resolved = true
-		return nil, nil
+
+		// We write a report to disk that indicates we could not decode
+		// the htlc.
+		resReport := h.report().resolverReport(
+			nil, channeldb.ResolverTypeIncomingHtlc,
+			channeldb.ResolverOutcomeAbandoned,
+		)
+		return nil, h.PutResolverReport(nil, resReport)
 	}
 
 	// Register for block epochs. After registration, the current height
@@ -119,13 +127,20 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 			"abandoning", h, h.htlcResolution.ClaimOutpoint,
 			h.htlcExpiry, currentHeight)
 		h.resolved = true
-		return nil, h.Checkpoint(h)
+
+		// Finally, get our report and checkpoint our resolver with a
+		// timeout outcome report.
+		report := h.report().resolverReport(
+			nil, channeldb.ResolverTypeIncomingHtlc,
+			channeldb.ResolverOutcomeTimeout,
+		)
+		return nil, h.Checkpoint(h, report)
 	}
 
-	// tryApplyPreimage is a helper function that will populate our internal
+	// applyPreimage is a helper function that will populate our internal
 	// resolver with the preimage we learn of. This should be called once
 	// the preimage is revealed so the inner resolver can properly complete
-	// its duties. The boolean return value indicates whether the preimage
+	// its duties. The error return value indicates whether the preimage
 	// was properly applied.
 	applyPreimage := func(preimage lntypes.Preimage) error {
 		// Sanity check to see if this preimage matches our htlc. At
@@ -140,7 +155,7 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		log.Infof("%T(%v): extracted preimage=%v from beacon!", h,
 			h.htlcResolution.ClaimOutpoint, preimage)
 
-		// If this our commitment transaction, then we'll need to
+		// If this is our commitment transaction, then we'll need to
 		// populate the witness for the second-level HTLC transaction.
 		if h.htlcResolution.SignedSuccessTx != nil {
 			// Within the witness for the success transaction, the
@@ -157,86 +172,137 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 		return nil
 	}
 
-	// If the HTLC hasn't expired yet, then we may still be able to claim
-	// it if we learn of the pre-image, so we'll subscribe to the preimage
-	// database to see if it turns up, or the HTLC times out.
-	//
-	// NOTE: This is done BEFORE opportunistically querying the db, to
-	// ensure the preimage can't be delivered between querying and
-	// registering for the preimage subscription.
-	preimageSubscription := h.PreimageDB.SubscribeUpdates()
-	defer preimageSubscription.CancelSubscription()
+	// Define a closure to process htlc resolutions either directly or
+	// triggered by future notifications.
+	processHtlcResolution := func(e invoices.HtlcResolution) (
+		ContractResolver, error) {
 
-	// Define closure to process hodl events either direct or triggered by
-	// later notifcation.
-	processHodlEvent := func(e invoices.HodlEvent) (ContractResolver,
-		error) {
+		// Take action based on the type of resolution we have
+		// received.
+		switch resolution := e.(type) {
 
-		if e.Preimage == nil {
+		// If the htlc resolution was a settle, apply the
+		// preimage and return a success resolver.
+		case *invoices.HtlcSettleResolution:
+			err := applyPreimage(resolution.Preimage)
+			if err != nil {
+				return nil, err
+			}
+
+			return &h.htlcSuccessResolver, nil
+
+		// If the htlc was failed, mark the htlc as
+		// resolved.
+		case *invoices.HtlcFailResolution:
 			log.Infof("%T(%v): Exit hop HTLC canceled "+
 				"(expiry=%v, height=%v), abandoning", h,
 				h.htlcResolution.ClaimOutpoint,
 				h.htlcExpiry, currentHeight)
 
 			h.resolved = true
-			return nil, h.Checkpoint(h)
+
+			// Checkpoint our resolver with an abandoned outcome
+			// because we take no further action on this htlc.
+			report := h.report().resolverReport(
+				nil, channeldb.ResolverTypeIncomingHtlc,
+				channeldb.ResolverOutcomeAbandoned,
+			)
+			return nil, h.Checkpoint(h, report)
+
+		// Error if the resolution type is unknown, we are only
+		// expecting settles and fails.
+		default:
+			return nil, fmt.Errorf("unknown resolution"+
+				" type: %v", e)
+		}
+	}
+
+	var (
+		hodlChan       chan interface{}
+		witnessUpdates <-chan lntypes.Preimage
+	)
+	if payload.FwdInfo.NextHop == hop.Exit {
+		// Create a buffered hodl chan to prevent deadlock.
+		hodlChan = make(chan interface{}, 1)
+
+		// Notify registry that we are potentially resolving as an exit
+		// hop on-chain. If this HTLC indeed pays to an existing
+		// invoice, the invoice registry will tell us what to do with
+		// the HTLC. This is identical to HTLC resolution in the link.
+		circuitKey := channeldb.CircuitKey{
+			ChanID: h.ShortChanID,
+			HtlcID: h.htlc.HtlcIndex,
 		}
 
-		if err := applyPreimage(*e.Preimage); err != nil {
+		resolution, err := h.Registry.NotifyExitHopHtlc(
+			h.htlc.RHash, h.htlc.Amt, h.htlcExpiry, currentHeight,
+			circuitKey, hodlChan, payload,
+		)
+		if err != nil {
 			return nil, err
 		}
 
-		return &h.htlcSuccessResolver, nil
-	}
-
-	// Create a buffered hodl chan to prevent deadlock.
-	hodlChan := make(chan interface{}, 1)
-
-	// Notify registry that we are potentially resolving as an exit hop
-	// on-chain. If this HTLC indeed pays to an existing invoice, the
-	// invoice registry will tell us what to do with the HTLC. This is
-	// identical to HTLC resolution in the link.
-	circuitKey := channeldb.CircuitKey{
-		ChanID: h.ShortChanID,
-		HtlcID: h.htlc.HtlcIndex,
-	}
-
-	event, err := h.Registry.NotifyExitHopHtlc(
-		h.htlc.RHash, h.htlc.Amt, h.htlcExpiry, currentHeight,
-		circuitKey, hodlChan, payload,
-	)
-	switch err {
-	case channeldb.ErrInvoiceNotFound:
-	case nil:
 		defer h.Registry.HodlUnsubscribeAll(hodlChan)
 
-		// Resolve the htlc directly if possible.
-		if event != nil {
-			return processHodlEvent(*event)
-		}
-	default:
-		return nil, err
-	}
+		// Take action based on the resolution we received. If the htlc
+		// was settled, or a htlc for a known invoice failed we can
+		// resolve it directly. If the resolution is nil, the htlc was
+		// neither accepted nor failed, so we cannot take action yet.
+		switch res := resolution.(type) {
+		case *invoices.HtlcFailResolution:
+			// In the case where the htlc failed, but the invoice
+			// was known to the registry, we can directly resolve
+			// the htlc.
+			if res.Outcome != invoices.ResultInvoiceNotFound {
+				return processHtlcResolution(resolution)
+			}
 
-	// With the epochs and preimage subscriptions initialized, we'll query
-	// to see if we already know the preimage.
-	preimage, ok := h.PreimageDB.LookupPreimage(h.htlc.RHash)
-	if ok {
-		// If we do, then this means we can claim the HTLC!  However,
-		// we don't know how to ourselves, so we'll return our inner
-		// resolver which has the knowledge to do so.
-		if err := applyPreimage(preimage); err != nil {
-			return nil, err
+		// If we settled the htlc, we can resolve it.
+		case *invoices.HtlcSettleResolution:
+			return processHtlcResolution(resolution)
+
+		// If the resolution is nil, the htlc was neither settled nor
+		// failed so we cannot take action at present.
+		case nil:
+
+		default:
+			return nil, fmt.Errorf("unknown htlc resolution type: %T",
+				resolution)
+		}
+	} else {
+		// If the HTLC hasn't expired yet, then we may still be able to
+		// claim it if we learn of the pre-image, so we'll subscribe to
+		// the preimage database to see if it turns up, or the HTLC
+		// times out.
+		//
+		// NOTE: This is done BEFORE opportunistically querying the db,
+		// to ensure the preimage can't be delivered between querying
+		// and registering for the preimage subscription.
+		preimageSubscription := h.PreimageDB.SubscribeUpdates()
+		defer preimageSubscription.CancelSubscription()
+
+		// With the epochs and preimage subscriptions initialized, we'll
+		// query to see if we already know the preimage.
+		preimage, ok := h.PreimageDB.LookupPreimage(h.htlc.RHash)
+		if ok {
+			// If we do, then this means we can claim the HTLC!
+			// However, we don't know how to ourselves, so we'll
+			// return our inner resolver which has the knowledge to
+			// do so.
+			if err := applyPreimage(preimage); err != nil {
+				return nil, err
+			}
+
+			return &h.htlcSuccessResolver, nil
 		}
 
-		return &h.htlcSuccessResolver, nil
+		witnessUpdates = preimageSubscription.WitnessUpdates
 	}
 
 	for {
-
 		select {
-		case preimage := <-preimageSubscription.WitnessUpdates:
-			// We receive all new preimages, so we need to ignore
+		case preimage := <-witnessUpdates:
+			// We received a new preimage, but we need to ignore
 			// all except the preimage we are waiting for.
 			if !preimage.Matches(h.htlc.RHash) {
 				continue
@@ -252,9 +318,8 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 			return &h.htlcSuccessResolver, nil
 
 		case hodlItem := <-hodlChan:
-			hodlEvent := hodlItem.(invoices.HodlEvent)
-
-			return processHodlEvent(hodlEvent)
+			htlcResolution := hodlItem.(invoices.HtlcResolution)
+			return processHtlcResolution(htlcResolution)
 
 		case newBlock, ok := <-blockEpochs.Epochs:
 			if !ok {
@@ -271,7 +336,13 @@ func (h *htlcIncomingContestResolver) Resolve() (ContractResolver, error) {
 					h.htlcResolution.ClaimOutpoint,
 					h.htlcExpiry, currentHeight)
 				h.resolved = true
-				return nil, h.Checkpoint(h)
+
+				report := h.report().resolverReport(
+					nil,
+					channeldb.ResolverTypeIncomingHtlc,
+					channeldb.ResolverOutcomeTimeout,
+				)
+				return nil, h.Checkpoint(h, report)
 			}
 
 		case <-h.quit:
@@ -293,7 +364,7 @@ func (h *htlcIncomingContestResolver) report() *ContractReport {
 
 	return &ContractReport{
 		Outpoint:       h.htlcResolution.ClaimOutpoint,
-		Incoming:       true,
+		Type:           ReportOutputIncomingHtlc,
 		Amount:         finalAmt,
 		MaturityHeight: h.htlcExpiry,
 		LimboBalance:   finalAmt,

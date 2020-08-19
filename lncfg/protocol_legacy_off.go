@@ -2,9 +2,9 @@
 
 package lncfg
 
-// LegacyProtocol is a struct that we use to be able to test backwards
-// compatibility of protocol additions, while defaulting to the latest within
-// lnd.
+// Legacy is a sub-config that houses all the legacy protocol options.  These
+// are mostly used for integration tests as most modern nodes shuld always run
+// with them on by default.
 type LegacyProtocol struct {
 }
 
@@ -15,8 +15,8 @@ func (l *LegacyProtocol) LegacyOnion() bool {
 	return false
 }
 
-// LegacyOnion returns true if the old commitment format should be used for new
-// funded channels.
-func (l *LegacyProtocol) LegacyCommitment() bool {
+// NoStaticRemoteKey returns true if the old commitment format with a tweaked
+// remote key should be used for new funded channels.
+func (l *LegacyProtocol) NoStaticRemoteKey() bool {
 	return false
 }

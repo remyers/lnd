@@ -1,6 +1,6 @@
 FROM golang:1.13-alpine as builder
 
-MAINTAINER Olaoluwa Osuntokun <lightning.engineering>
+LABEL maintainer="Olaoluwa Osuntokun <laolu@lightning.engineering>"
 
 # Force Go to use the cgo based DNS resolver. This is required to ensure DNS
 # queries required to connect to linked containers succeed.
@@ -16,7 +16,7 @@ COPY . /go/src/github.com/lightningnetwork/lnd
 
 RUN cd /go/src/github.com/lightningnetwork/lnd \
 &&  make \
-&&  make install tags="signrpc walletrpc chainrpc invoicesrpc routerrpc"
+&&  make install tags="signrpc walletrpc chainrpc invoicesrpc"
 
 # Start a new, final image to reduce size.
 FROM alpine as final

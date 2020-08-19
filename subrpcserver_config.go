@@ -5,6 +5,7 @@ import (
 	"reflect"
 
 	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btclog"
 	"github.com/lightningnetwork/lnd/autopilot"
 	"github.com/lightningnetwork/lnd/channeldb"
 	"github.com/lightningnetwork/lnd/htlcswitch"
@@ -18,6 +19,7 @@ import (
 	"github.com/lightningnetwork/lnd/lnrpc/walletrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/watchtowerrpc"
 	"github.com/lightningnetwork/lnd/lnrpc/wtclientrpc"
+	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/lightningnetwork/lnd/netann"
 	"github.com/lightningnetwork/lnd/routing"
@@ -79,7 +81,7 @@ type subRPCServerConfigs struct {
 //
 // NOTE: This MUST be called before any callers are permitted to execute the
 // FetchConfig method.
-func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
+func (s *subRPCServerConfigs) PopulateDependencies(cfg *Config, cc *chainControl,
 	networkDir string, macService *macaroons.Service,
 	atpl *autopilot.Manager,
 	invoiceRegistry *invoices.InvoiceRegistry,
@@ -92,7 +94,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
 	sweeper *sweep.UtxoSweeper,
 	tower *watchtower.Standalone,
 	towerClient wtclient.Client,
-	tcpResolver lncfg.TCPResolver) error {
+	tcpResolver lncfg.TCPResolver,
+	genInvoiceFeatures func() *lnwire.FeatureVector,
+	rpcLogger btclog.Logger) error {
 
 	// First, we'll use reflect to obtain a version of the config struct
 	// that allows us to programmatically inspect its fields.
@@ -130,6 +134,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
 			subCfgValue.FieldByName("Signer").Set(
 				reflect.ValueOf(cc.signer),
 			)
+			subCfgValue.FieldByName("KeyRing").Set(
+				reflect.ValueOf(cc.keyRing),
+			)
 
 		case *walletrpc.Config:
 			subCfgValue := extractReflectValue(subCfg)
@@ -146,6 +153,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
 			subCfgValue.FieldByName("Wallet").Set(
 				reflect.ValueOf(cc.wallet),
 			)
+			subCfgValue.FieldByName("CoinSelectionLocker").Set(
+				reflect.ValueOf(cc.wallet),
+			)
 			subCfgValue.FieldByName("KeyRing").Set(
 				reflect.ValueOf(cc.keyRing),
 			)
@@ -154,6 +164,9 @@ func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
 			)
 			subCfgValue.FieldByName("Chain").Set(
 				reflect.ValueOf(cc.chainIO),
+			)
+			subCfgValue.FieldByName("ChainParams").Set(
+				reflect.ValueOf(activeNetParams),
 			)
 
 		case *autopilotrpc.Config:
@@ -197,11 +210,8 @@ func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
 			subCfgValue.FieldByName("NodeSigner").Set(
 				reflect.ValueOf(nodeSigner),
 			)
-			subCfgValue.FieldByName("MaxPaymentMSat").Set(
-				reflect.ValueOf(MaxPaymentMSat),
-			)
 			defaultDelta := cfg.Bitcoin.TimeLockDelta
-			if registeredChains.PrimaryChain() == litecoinChain {
+			if cfg.registeredChains.PrimaryChain() == litecoinChain {
 				defaultDelta = cfg.Litecoin.TimeLockDelta
 			}
 			subCfgValue.FieldByName("DefaultCLTVExpiry").Set(
@@ -210,22 +220,13 @@ func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
 			subCfgValue.FieldByName("ChanDB").Set(
 				reflect.ValueOf(chanDB),
 			)
+			subCfgValue.FieldByName("GenInvoiceFeatures").Set(
+				reflect.ValueOf(genInvoiceFeatures),
+			)
 
+		// RouterRPC isn't conditionally compiled and doesn't need to be
+		// populated using reflection.
 		case *routerrpc.Config:
-			subCfgValue := extractReflectValue(subCfg)
-
-			subCfgValue.FieldByName("NetworkDir").Set(
-				reflect.ValueOf(networkDir),
-			)
-			subCfgValue.FieldByName("MacService").Set(
-				reflect.ValueOf(macService),
-			)
-			subCfgValue.FieldByName("Router").Set(
-				reflect.ValueOf(chanRouter),
-			)
-			subCfgValue.FieldByName("RouterBackend").Set(
-				reflect.ValueOf(routerBackend),
-			)
 
 		case *watchtowerrpc.Config:
 			subCfgValue := extractReflectValue(subCfg)
@@ -251,12 +252,21 @@ func (s *subRPCServerConfigs) PopulateDependencies(cc *chainControl,
 			subCfgValue.FieldByName("Resolver").Set(
 				reflect.ValueOf(tcpResolver),
 			)
+			subCfgValue.FieldByName("Log").Set(
+				reflect.ValueOf(rpcLogger),
+			)
 
 		default:
 			return fmt.Errorf("unknown field: %v, %T", fieldName,
 				cfg)
 		}
 	}
+
+	// Populate routerrpc dependencies.
+	s.RouterRPC.NetworkDir = networkDir
+	s.RouterRPC.MacService = macService
+	s.RouterRPC.Router = chanRouter
+	s.RouterRPC.RouterBackend = routerBackend
 
 	return nil
 }

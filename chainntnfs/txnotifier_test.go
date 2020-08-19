@@ -1138,7 +1138,7 @@ func TestTxNotifierCancelConf(t *testing.T) {
 	hintCache := newMockHintCache()
 	n := chainntnfs.NewTxNotifier(startingHeight, 100, hintCache, hintCache)
 
-	// We'll register two notification requests. Only the second one will be
+	// We'll register three notification requests. The last two will be
 	// canceled.
 	tx1 := wire.NewMsgTx(1)
 	tx1.AddTxOut(&wire.TxOut{PkScript: testRawScript})
@@ -1155,8 +1155,15 @@ func TestTxNotifierCancelConf(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unable to register spend ntfn: %v", err)
 	}
+	ntfn3, err := n.RegisterConf(&tx2Hash, testRawScript, 1, 1)
+	if err != nil {
+		t.Fatalf("unable to register spend ntfn: %v", err)
+	}
+	cancelConfRequest := ntfn2.HistoricalDispatch.ConfRequest
 
-	// Construct a block that will confirm both transactions.
+	// Extend the chain with a block that will confirm both transactions.
+	// This will queue confirmation notifications to dispatch once their
+	// respective heights have been met.
 	block := btcutil.NewBlock(&wire.MsgBlock{
 		Transactions: []*wire.MsgTx{tx1, tx2},
 	})
@@ -1167,14 +1174,18 @@ func TestTxNotifierCancelConf(t *testing.T) {
 		Tx:          tx1,
 	}
 
-	// Before extending the notifier's tip with the block above, we'll
-	// cancel the second request.
-	n.CancelConf(ntfn2.HistoricalDispatch.ConfRequest, 2)
+	// Cancel the second notification before connecting the block.
+	n.CancelConf(cancelConfRequest, 2)
 
 	err = n.ConnectTip(block.Hash(), startingHeight+1, block.Transactions())
 	if err != nil {
 		t.Fatalf("unable to connect block: %v", err)
 	}
+
+	// Cancel the third notification before notifying to ensure its queued
+	// confirmation notification gets removed as well.
+	n.CancelConf(cancelConfRequest, 3)
+
 	if err := n.NotifyHeight(startingHeight + 1); err != nil {
 		t.Fatalf("unable to dispatch notifications: %v", err)
 	}
@@ -1188,11 +1199,19 @@ func TestTxNotifierCancelConf(t *testing.T) {
 		t.Fatalf("expected to receive confirmation notification")
 	}
 
-	// The second one, however, should not have. The event's Confirmed
+	// The second and third, however, should not have. The event's Confirmed
 	// channel must have also been closed to indicate the caller that the
 	// TxNotifier can no longer fulfill their canceled request.
 	select {
 	case _, ok := <-ntfn2.Event.Confirmed:
+		if ok {
+			t.Fatal("expected Confirmed channel to be closed")
+		}
+	default:
+		t.Fatal("expected Confirmed channel to be closed")
+	}
+	select {
+	case _, ok := <-ntfn3.Event.Confirmed:
 		if ok {
 			t.Fatal("expected Confirmed channel to be closed")
 		}
@@ -2152,6 +2171,210 @@ func TestTxNotifierSpendHintCache(t *testing.T) {
 	}
 	if op2Hint != op1Height {
 		t.Fatalf("expected hint %d, got %d", op1Height, op2Hint)
+	}
+}
+
+// TestTxNotifierSpendHinthistoricalRescan checks that the height hints and
+// spend notifications behave as expected when a spend is found at tip during a
+// historical rescan.
+func TestTxNotifierSpendDuringHistoricalRescan(t *testing.T) {
+	t.Parallel()
+
+	const (
+		startingHeight = 200
+		reorgSafety    = 10
+	)
+
+	// Intiialize our TxNotifier instance backed by a height hint cache.
+	hintCache := newMockHintCache()
+	n := chainntnfs.NewTxNotifier(
+		startingHeight, reorgSafety, hintCache, hintCache,
+	)
+
+	// Create a test outpoint and register it for spend notifications.
+	op1 := wire.OutPoint{Index: 1}
+	ntfn1, err := n.RegisterSpend(&op1, testRawScript, 1)
+	if err != nil {
+		t.Fatalf("unable to register spend for op1: %v", err)
+	}
+
+	// A historical rescan should be initiated from the height hint to the
+	// current height.
+	if ntfn1.HistoricalDispatch.StartHeight != 1 {
+		t.Fatalf("expected historical dispatch to start at height hint")
+	}
+
+	if ntfn1.HistoricalDispatch.EndHeight != startingHeight {
+		t.Fatalf("expected historical dispatch to end at current height")
+	}
+
+	// It should not have a spend hint set upon registration, as we must
+	// first determine whether it has already been spent in the chain.
+	_, err = hintCache.QuerySpendHint(ntfn1.HistoricalDispatch.SpendRequest)
+	if err != chainntnfs.ErrSpendHintNotFound {
+		t.Fatalf("unexpected error when querying for height hint "+
+			"expected: %v, got %v", chainntnfs.ErrSpendHintNotFound,
+			err)
+	}
+
+	// Create a new empty block and extend the chain.
+	height := uint32(startingHeight) + 1
+	emptyBlock := btcutil.NewBlock(&wire.MsgBlock{})
+	err = n.ConnectTip(
+		emptyBlock.Hash(), height, emptyBlock.Transactions(),
+	)
+	if err != nil {
+		t.Fatalf("unable to connect block: %v", err)
+	}
+	if err := n.NotifyHeight(height); err != nil {
+		t.Fatalf("unable to dispatch notifications: %v", err)
+	}
+
+	// Since we haven't called UpdateSpendDetails yet, there should be no
+	// spend hint found.
+	_, err = hintCache.QuerySpendHint(ntfn1.HistoricalDispatch.SpendRequest)
+	if err != chainntnfs.ErrSpendHintNotFound {
+		t.Fatalf("unexpected error when querying for height hint "+
+			"expected: %v, got %v", chainntnfs.ErrSpendHintNotFound,
+			err)
+	}
+
+	// Simulate a bunch of blocks being mined while the historical rescan
+	// is still in progress. We make sure to not mine more than reorgSafety
+	// blocks after the spend, since it will be forgotten then.
+	var spendHeight uint32
+	for i := 0; i < reorgSafety; i++ {
+		height++
+
+		// Let the outpoint we are watching be spent midway.
+		var block *btcutil.Block
+		if i == 5 {
+			// We'll create a new block that only contains the
+			// spending transaction of the outpoint.
+			spendTx1 := wire.NewMsgTx(2)
+			spendTx1.AddTxIn(&wire.TxIn{
+				PreviousOutPoint: op1,
+				SignatureScript:  testSigScript,
+			})
+			block = btcutil.NewBlock(&wire.MsgBlock{
+				Transactions: []*wire.MsgTx{spendTx1},
+			})
+			spendHeight = height
+		} else {
+			// Otherwise we just create an empty block.
+			block = btcutil.NewBlock(&wire.MsgBlock{})
+		}
+
+		err = n.ConnectTip(
+			block.Hash(), height, block.Transactions(),
+		)
+		if err != nil {
+			t.Fatalf("unable to connect block: %v", err)
+		}
+		if err := n.NotifyHeight(height); err != nil {
+			t.Fatalf("unable to dispatch notifications: %v", err)
+		}
+	}
+
+	// Check that the height hint was set to the spending block.
+	op1Hint, err := hintCache.QuerySpendHint(
+		ntfn1.HistoricalDispatch.SpendRequest,
+	)
+	if err != nil {
+		t.Fatalf("unable to query for spend hint of op1: %v", err)
+	}
+	if op1Hint != spendHeight {
+		t.Fatalf("expected hint %d, got %d", spendHeight, op1Hint)
+	}
+
+	// We should be getting notified about the spend at this point.
+	select {
+	case <-ntfn1.Event.Spend:
+	default:
+		t.Fatal("expected to receive spend notification")
+	}
+
+	// Now, we'll simulate that the historical rescan finished by
+	// calling UpdateSpendDetails. Since a the spend actually happened at
+	// tip while the rescan was in progress, the height hint should not be
+	// updated to the latest height, but stay at the spend height.
+	err = n.UpdateSpendDetails(ntfn1.HistoricalDispatch.SpendRequest, nil)
+	if err != nil {
+		t.Fatalf("unable to update spend details: %v", err)
+	}
+
+	op1Hint, err = hintCache.QuerySpendHint(
+		ntfn1.HistoricalDispatch.SpendRequest,
+	)
+	if err != nil {
+		t.Fatalf("unable to query for spend hint of op1: %v", err)
+	}
+	if op1Hint != spendHeight {
+		t.Fatalf("expected hint %d, got %d", spendHeight, op1Hint)
+	}
+
+	// Then, we'll create another block that spends a second outpoint.
+	op2 := wire.OutPoint{Index: 2}
+	spendTx2 := wire.NewMsgTx(2)
+	spendTx2.AddTxIn(&wire.TxIn{
+		PreviousOutPoint: op2,
+		SignatureScript:  testSigScript,
+	})
+	height++
+	block2 := btcutil.NewBlock(&wire.MsgBlock{
+		Transactions: []*wire.MsgTx{spendTx2},
+	})
+	err = n.ConnectTip(block2.Hash(), height, block2.Transactions())
+	if err != nil {
+		t.Fatalf("unable to connect block: %v", err)
+	}
+	if err := n.NotifyHeight(height); err != nil {
+		t.Fatalf("unable to dispatch notifications: %v", err)
+	}
+
+	// The outpoint's spend hint should remain the same as it's already
+	// been spent before.
+	op1Hint, err = hintCache.QuerySpendHint(ntfn1.HistoricalDispatch.SpendRequest)
+	if err != nil {
+		t.Fatalf("unable to query for spend hint of op1: %v", err)
+	}
+	if op1Hint != spendHeight {
+		t.Fatalf("expected hint %d, got %d", spendHeight, op1Hint)
+	}
+
+	// Now mine enough blocks for the spend notification to be forgotten.
+	for i := 0; i < 2*reorgSafety; i++ {
+		height++
+		block := btcutil.NewBlock(&wire.MsgBlock{})
+
+		err := n.ConnectTip(
+			block.Hash(), height, block.Transactions(),
+		)
+		if err != nil {
+			t.Fatalf("unable to connect block: %v", err)
+		}
+		if err := n.NotifyHeight(height); err != nil {
+			t.Fatalf("unable to dispatch notifications: %v", err)
+		}
+	}
+
+	// Attempting to update spend details at this point should fail, since
+	// the spend request should be removed. This is to ensure the height
+	// hint won't be overwritten if the historical rescan finishes after
+	// the spend request has been notified and removed because it has
+	// matured.
+	err = n.UpdateSpendDetails(ntfn1.HistoricalDispatch.SpendRequest, nil)
+	if err == nil {
+		t.Fatalf("expcted updating spend details to fail")
+	}
+
+	// Finally, check that the height hint is still there, unchanged.
+	op1Hint, err = hintCache.QuerySpendHint(ntfn1.HistoricalDispatch.SpendRequest)
+	if err != nil {
+		t.Fatalf("unable to query for spend hint of op1: %v", err)
+	}
+	if op1Hint != spendHeight {
+		t.Fatalf("expected hint %d, got %d", spendHeight, op1Hint)
 	}
 }
 

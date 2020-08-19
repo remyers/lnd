@@ -95,7 +95,7 @@
   * **Go modules:** This project uses [Go modules](https://github.com/golang/go/wiki/Modules) 
     to manage dependencies as well as to provide *reproducible builds*.
 
-    Usage of Go modules (with Go 1.12) means that you no longer need to clone
+    Usage of Go modules (with Go 1.13) means that you no longer need to clone
     `lnd` into your `$GOPATH` for development purposes. Instead, your `lnd`
     repo can now live anywhere!
 
@@ -104,13 +104,27 @@
 With the preliminary steps completed, to install `lnd`, `lncli`, and all
 related dependencies run the following commands:
 ```
-go get -d github.com/lightningnetwork/lnd
-cd $GOPATH/src/github.com/lightningnetwork/lnd
-make && make install
+git clone https://github.com/lightningnetwork/lnd
+cd lnd
+make install
 ```
 
+The command above will install the current _master_ branch of `lnd`. If you
+wish to install a tagged release of `lnd` (as the master branch can at times be
+unstable), then [visit then release page to locate the latest
+release](https://github.com/lightningnetwork/lnd/releases). Assuming the name
+of the release is `v0.x.x`, then you can compile this release from source with
+a small modification to the above command: 
+```
+git clone https://github.com/lightningnetwork/lnd
+cd lnd
+git checkout v0.x.x
+make install
+```
+
+
 **NOTE**: Our instructions still use the `$GOPATH` directory from prior
-versions of Go, but with Go 1.12, it's now possible for `lnd` to live
+versions of Go, but with Go 1.13, it's now possible for `lnd` to live
 _anywhere_ on your file system.
 
 For Windows WSL users, make will need to be referenced directly via
@@ -208,6 +222,7 @@ bitcoind:
       --bitcoind.rpcpass=                                     Password for RPC connections
       --bitcoind.zmqpubrawblock=                              The address listening for ZMQ connections to deliver raw block notifications
       --bitcoind.zmqpubrawtx=                                 The address listening for ZMQ connections to deliver raw transaction notifications
+      --bitcoind.estimatemode=                                The fee estimate mode. Must be either "ECONOMICAL" or "CONSERVATIVE". (default: CONSERVATIVE)
 ```
 
 ## Using btcd
@@ -367,6 +382,9 @@ lnd --bitcoin.active --bitcoin.testnet --debuglevel=debug --bitcoin.node=bitcoin
   the default `bitcoind` settings, having more than one instance of `lnd`, or
   `lnd` plus any application that consumes the RPC could cause `lnd` to miss
   crucial updates from the backend.
+- The default fee estimate mode in `bitcoind` is CONSERVATIVE. You can set
+  `bitcoind.estimatemode=ECONOMICAL` to change it into ECONOMICAL. Futhermore,
+  if you start `bitcoind` in `regtest`, this configuration won't take any effect.
 
 
 # Creating a wallet

@@ -17,6 +17,12 @@ type Config struct {
 	// NoStaticRemoteKey unsets any optional or required StaticRemoteKey
 	// bits from all feature sets.
 	NoStaticRemoteKey bool
+
+	// NoAnchors unsets any bits signaling support for anchor outputs.
+	NoAnchors bool
+
+	// NoWumbo unsets any bits signalling support for wumbo channels.
+	NoWumbo bool
 }
 
 // Manager is responsible for generating feature vectors for different requested
@@ -33,7 +39,7 @@ func NewManager(cfg Config) (*Manager, error) {
 	return newManager(cfg, defaultSetDesc)
 }
 
-// newManager creates a new feeature Manager, applying any custom modifications
+// newManager creates a new feature Manager, applying any custom modifications
 // to its feature sets before returning. This method accepts the setDesc as its
 // own parameter so that it can be unit tested.
 func newManager(cfg Config, desc setDesc) (*Manager, error) {
@@ -63,14 +69,35 @@ func newManager(cfg Config, desc setDesc) (*Manager, error) {
 	}
 
 	// Now, remove any features as directed by the config.
-	for _, fv := range fsets {
+	for set, raw := range fsets {
 		if cfg.NoTLVOnion {
-			fv.Unset(lnwire.TLVOnionPayloadOptional)
-			fv.Unset(lnwire.TLVOnionPayloadRequired)
+			raw.Unset(lnwire.TLVOnionPayloadOptional)
+			raw.Unset(lnwire.TLVOnionPayloadRequired)
+			raw.Unset(lnwire.PaymentAddrOptional)
+			raw.Unset(lnwire.PaymentAddrRequired)
+			raw.Unset(lnwire.MPPOptional)
+			raw.Unset(lnwire.MPPRequired)
 		}
 		if cfg.NoStaticRemoteKey {
-			fv.Unset(lnwire.StaticRemoteKeyOptional)
-			fv.Unset(lnwire.StaticRemoteKeyRequired)
+			raw.Unset(lnwire.StaticRemoteKeyOptional)
+			raw.Unset(lnwire.StaticRemoteKeyRequired)
+		}
+		if cfg.NoAnchors {
+			raw.Unset(lnwire.AnchorsOptional)
+			raw.Unset(lnwire.AnchorsRequired)
+		}
+		if cfg.NoWumbo {
+			raw.Unset(lnwire.WumboChannelsOptional)
+			raw.Unset(lnwire.WumboChannelsRequired)
+		}
+
+		// Ensure that all of our feature sets properly set any
+		// dependent features.
+		fv := lnwire.NewFeatureVector(raw, lnwire.Features)
+		err := ValidateDeps(fv)
+		if err != nil {
+			return nil, fmt.Errorf("invalid feature set %v: %v",
+				set, err)
 		}
 	}
 
@@ -94,4 +121,15 @@ func (m *Manager) GetRaw(set Set) *lnwire.RawFeatureVector {
 func (m *Manager) Get(set Set) *lnwire.FeatureVector {
 	raw := m.GetRaw(set)
 	return lnwire.NewFeatureVector(raw, lnwire.Features)
+}
+
+// ListSets returns a list of the feature sets that our node supports.
+func (m *Manager) ListSets() []Set {
+	var sets []Set
+
+	for set := range m.fsets {
+		sets = append(sets, set)
+	}
+
+	return sets
 }

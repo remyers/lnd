@@ -21,10 +21,12 @@ import (
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcutil"
+	"github.com/lightningnetwork/lnd/lncfg"
 
 	"github.com/lightningnetwork/lnd/chainntnfs"
 	"github.com/lightningnetwork/lnd/chanacceptor"
 	"github.com/lightningnetwork/lnd/channeldb"
+	"github.com/lightningnetwork/lnd/channelnotifier"
 	"github.com/lightningnetwork/lnd/discovery"
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/input"
@@ -48,6 +50,10 @@ const (
 	// testPollSleepMs is the number of milliseconds to sleep between
 	// each attempt to access the database to check its state.
 	testPollSleepMs = 500
+
+	// maxPending is the maximum number of channels we allow opening to the
+	// same peer in the max pending channels test.
+	maxPending = 4
 )
 
 var (
@@ -126,6 +132,10 @@ func (m *mockNotifier) Start() error {
 	return nil
 }
 
+func (m *mockNotifier) Started() bool {
+	return true
+}
+
 func (m *mockNotifier) Stop() error {
 	return nil
 }
@@ -138,6 +148,29 @@ func (m *mockNotifier) RegisterSpendNtfn(outpoint *wire.OutPoint, _ []byte,
 	}, nil
 }
 
+type mockChanEvent struct {
+	openEvent        chan wire.OutPoint
+	pendingOpenEvent chan channelnotifier.PendingOpenChannelEvent
+}
+
+func (m *mockChanEvent) NotifyOpenChannelEvent(outpoint wire.OutPoint) {
+	m.openEvent <- outpoint
+}
+
+func (m *mockChanEvent) NotifyPendingOpenChannelEvent(outpoint wire.OutPoint,
+	pendingChannel *channeldb.OpenChannel) {
+
+	m.pendingOpenEvent <- channelnotifier.PendingOpenChannelEvent{
+		ChannelPoint:   &outpoint,
+		PendingChannel: pendingChannel,
+	}
+}
+
+type newChannelMsg struct {
+	channel *channeldb.OpenChannel
+	err     chan error
+}
+
 type testNode struct {
 	privKey         *btcec.PrivateKey
 	addr            *lnwire.NetAddress
@@ -147,8 +180,10 @@ type testNode struct {
 	fundingMgr      *fundingManager
 	newChannels     chan *newChannelMsg
 	mockNotifier    *mockNotifier
+	mockChanEvent   *mockChanEvent
 	testDir         string
 	shutdownChannel chan struct{}
+	remoteFeatures  []lnwire.FeatureBit
 
 	remotePeer  *testNode
 	sendMessage func(lnwire.Message) error
@@ -176,9 +211,7 @@ func (n *testNode) SendMessageLazy(sync bool, msgs ...lnwire.Message) error {
 	return n.SendMessage(sync, msgs...)
 }
 
-func (n *testNode) WipeChannel(_ *wire.OutPoint) error {
-	return nil
-}
+func (n *testNode) WipeChannel(_ *wire.OutPoint) {}
 
 func (n *testNode) QuitSignal() <-chan struct{} {
 	return n.shutdownChannel
@@ -189,7 +222,9 @@ func (n *testNode) LocalFeatures() *lnwire.FeatureVector {
 }
 
 func (n *testNode) RemoteFeatures() *lnwire.FeatureVector {
-	return lnwire.NewFeatureVector(nil, nil)
+	return lnwire.NewFeatureVector(
+		lnwire.NewRawFeatureVector(n.remoteFeatures...), nil,
+	)
 }
 
 func (n *testNode) AddNewChannel(channel *channeldb.OpenChannel,
@@ -271,6 +306,17 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 		bestHeight: fundingBroadcastHeight,
 	}
 
+	// The mock channel event notifier will receive events for each pending
+	// open and open channel. Because some tests will create multiple
+	// channels in a row before advancing to the next step, these channels
+	// need to be buffered.
+	evt := &mockChanEvent{
+		openEvent: make(chan wire.OutPoint, maxPending),
+		pendingOpenEvent: make(
+			chan channelnotifier.PendingOpenChannelEvent, maxPending,
+		),
+	}
+
 	dbDir := filepath.Join(tempTestDir, "cdb")
 	cdb, err := channeldb.Open(dbDir)
 	if err != nil {
@@ -298,7 +344,9 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 		Wallet:       lnw,
 		Notifier:     chainNotifier,
 		FeeEstimator: estimator,
-		SignMessage: func(pubKey *btcec.PublicKey, msg []byte) (*btcec.Signature, error) {
+		SignMessage: func(pubKey *btcec.PublicKey,
+			msg []byte) (input.Signature, error) {
+
 			return testSig, nil
 		},
 		SendAnnouncement: func(msg lnwire.Message,
@@ -333,11 +381,12 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 			return nil, fmt.Errorf("unable to find channel")
 		},
 		DefaultRoutingPolicy: htlcswitch.ForwardingPolicy{
-			MinHTLC:       5,
+			MinHTLCOut:    5,
 			BaseFee:       100,
 			FeeRate:       1000,
 			TimeLockDelta: 10,
 		},
+		DefaultMinHtlcIn: 5,
 		NumRequiredConfs: func(chanAmt btcutil.Amount,
 			pushAmt lnwire.MilliSatoshi) uint16 {
 			return 3
@@ -368,15 +417,17 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 		ReportShortChanID: func(wire.OutPoint) error {
 			return nil
 		},
-		PublishTransaction: func(txn *wire.MsgTx) error {
+		PublishTransaction: func(txn *wire.MsgTx, _ string) error {
 			publTxChan <- txn
 			return nil
 		},
-		ZombieSweeperInterval:  1 * time.Hour,
-		ReservationTimeout:     1 * time.Nanosecond,
-		MaxPendingChannels:     DefaultMaxPendingChannels,
-		NotifyOpenChannelEvent: func(wire.OutPoint) {},
-		OpenChannelPredicate:   chainedAcceptor,
+		ZombieSweeperInterval:         1 * time.Hour,
+		ReservationTimeout:            1 * time.Nanosecond,
+		MaxPendingChannels:            lncfg.DefaultMaxPendingChannels,
+		NotifyOpenChannelEvent:        evt.NotifyOpenChannelEvent,
+		OpenChannelPredicate:          chainedAcceptor,
+		NotifyPendingOpenChannelEvent: evt.NotifyPendingOpenChannelEvent,
+		RegisteredChains:              newChainRegistry(),
 	}
 
 	for _, op := range options {
@@ -399,6 +450,7 @@ func createTestFundingManager(t *testing.T, privKey *btcec.PrivateKey,
 		publTxChan:      publTxChan,
 		fundingMgr:      f,
 		mockNotifier:    chainNotifier,
+		mockChanEvent:   evt,
 		testDir:         tempTestDir,
 		shutdownChannel: shutdownChan,
 		addr:            addr,
@@ -435,7 +487,7 @@ func recreateAliceFundingManager(t *testing.T, alice *testNode) {
 		Notifier:     oldCfg.Notifier,
 		FeeEstimator: oldCfg.FeeEstimator,
 		SignMessage: func(pubKey *btcec.PublicKey,
-			msg []byte) (*btcec.Signature, error) {
+			msg []byte) (input.Signature, error) {
 			return testSig, nil
 		},
 		SendAnnouncement: func(msg lnwire.Message,
@@ -461,13 +513,14 @@ func recreateAliceFundingManager(t *testing.T, alice *testNode) {
 		TempChanIDSeed: oldCfg.TempChanIDSeed,
 		FindChannel:    oldCfg.FindChannel,
 		DefaultRoutingPolicy: htlcswitch.ForwardingPolicy{
-			MinHTLC:       5,
+			MinHTLCOut:    5,
 			BaseFee:       100,
 			FeeRate:       1000,
 			TimeLockDelta: 10,
 		},
+		DefaultMinHtlcIn:       5,
 		RequiredRemoteMaxValue: oldCfg.RequiredRemoteMaxValue,
-		PublishTransaction: func(txn *wire.MsgTx) error {
+		PublishTransaction: func(txn *wire.MsgTx, _ string) error {
 			publishChan <- txn
 			return nil
 		},
@@ -679,6 +732,18 @@ func fundChannel(t *testing.T, alice, bob *testNode, localFundingAmt,
 		t.Fatalf("alice did not publish funding tx")
 	}
 
+	// Make sure the notification about the pending channel was sent out.
+	select {
+	case <-alice.mockChanEvent.pendingOpenEvent:
+	case <-time.After(time.Second * 5):
+		t.Fatalf("alice did not send pending channel event")
+	}
+	select {
+	case <-bob.mockChanEvent.pendingOpenEvent:
+	case <-time.After(time.Second * 5):
+		t.Fatalf("bob did not send pending channel event")
+	}
+
 	// Finally, make sure neither have active reservation for the channel
 	// now pending open in the database.
 	assertNumPendingReservations(t, alice, bobPubKey, 0)
@@ -861,6 +926,18 @@ func assertMarkedOpen(t *testing.T, alice, bob *testNode,
 	fundingOutPoint *wire.OutPoint) {
 	t.Helper()
 
+	// Make sure the notification about the pending channel was sent out.
+	select {
+	case <-alice.mockChanEvent.openEvent:
+	case <-time.After(time.Second * 5):
+		t.Fatalf("alice did not send open channel event")
+	}
+	select {
+	case <-bob.mockChanEvent.openEvent:
+	case <-time.After(time.Second * 5):
+		t.Fatalf("bob did not send open channel event")
+	}
+
 	assertDatabaseState(t, alice, fundingOutPoint, markedOpen)
 	assertDatabaseState(t, bob, fundingOutPoint, markedOpen)
 }
@@ -889,7 +966,8 @@ func assertAddedToRouterGraph(t *testing.T, alice, bob *testNode,
 // advertised value will be checked against the other node's default min_htlc
 // value.
 func assertChannelAnnouncements(t *testing.T, alice, bob *testNode,
-	capacity btcutil.Amount, customMinHtlc ...lnwire.MilliSatoshi) {
+	capacity btcutil.Amount, customMinHtlc []lnwire.MilliSatoshi,
+	customMaxHtlc []lnwire.MilliSatoshi) {
 	t.Helper()
 
 	// After the FundingLocked message is sent, Alice and Bob will each
@@ -923,7 +1001,7 @@ func assertChannelAnnouncements(t *testing.T, alice, bob *testNode,
 				// _other_ node.
 				other := (j + 1) % 2
 				minHtlc := nodes[other].fundingMgr.cfg.
-					DefaultRoutingPolicy.MinHTLC
+					DefaultMinHtlcIn
 
 				// We might expect a custom MinHTLC value.
 				if len(customMinHtlc) > 0 {
@@ -942,21 +1020,28 @@ func assertChannelAnnouncements(t *testing.T, alice, bob *testNode,
 						minHtlc, m.HtlcMinimumMsat)
 				}
 
-				// The MaxHTLC value should at this point
-				// _always_ be the same as the
-				// maxValueInFlight capacity.
+				maxHtlc := alice.fundingMgr.cfg.RequiredRemoteMaxValue(
+					capacity,
+				)
+				// We might expect a custom MaxHltc value.
+				if len(customMaxHtlc) > 0 {
+					if len(customMaxHtlc) != 2 {
+						t.Fatalf("only 0 or 2 custom " +
+							"min htlc values " +
+							"currently supported")
+					}
+
+					maxHtlc = customMaxHtlc[j]
+				}
 				if m.MessageFlags != 1 {
 					t.Fatalf("expected message flags to "+
 						"be 1, was %v", m.MessageFlags)
 				}
 
-				maxPendingMsat := alice.fundingMgr.cfg.RequiredRemoteMaxValue(
-					capacity,
-				)
-				if maxPendingMsat != m.HtlcMaximumMsat {
+				if maxHtlc != m.HtlcMaximumMsat {
 					t.Fatalf("expected ChannelUpdate to "+
 						"advertise max HTLC %v, had %v",
-						maxPendingMsat,
+						maxHtlc,
 						m.HtlcMaximumMsat)
 				}
 
@@ -1142,7 +1227,7 @@ func TestFundingManagerNormalWorkflow(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// Check that the state machine is updated accordingly
 	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
@@ -1294,7 +1379,7 @@ func TestFundingManagerRestartBehavior(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// Check that the state machine is updated accordingly
 	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
@@ -1432,7 +1517,7 @@ func TestFundingManagerOfflinePeer(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// Check that the state machine is updated accordingly
 	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
@@ -1840,7 +1925,7 @@ func TestFundingManagerReceiveFundingLockedTwice(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// Check that the state machine is updated accordingly
 	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
@@ -1943,7 +2028,7 @@ func TestFundingManagerRestartAfterChanAnn(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// Check that the state machine is updated accordingly
 	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
@@ -2044,7 +2129,7 @@ func TestFundingManagerRestartAfterReceivingFundingLocked(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// Check that the state machine is updated accordingly
 	assertAddedToRouterGraph(t, alice, bob, fundingOutPoint)
@@ -2115,7 +2200,7 @@ func TestFundingManagerPrivateChannel(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// The funding transaction is now confirmed, wait for the
 	// OpenStatusUpdate_ChanOpen update
@@ -2228,7 +2313,7 @@ func TestFundingManagerPrivateRestart(t *testing.T) {
 
 	// Make sure both fundingManagers send the expected channel
 	// announcements.
-	assertChannelAnnouncements(t, alice, bob, capacity)
+	assertChannelAnnouncements(t, alice, bob, capacity, nil, nil)
 
 	// Note: We don't check for the addedToRouterGraph state because in
 	// the private channel mode, the state is quickly changed from
@@ -2322,7 +2407,9 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 
 	// This is the custom parameters we'll use.
 	const csvDelay = 67
-	const minHtlc = 1234
+	const minHtlcIn = 1234
+	const maxValueInFlight = 50000
+	const fundingAmt = 5000000
 
 	// We will consume the channel updates as we go, so no buffering is
 	// needed.
@@ -2336,15 +2423,16 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 	// workflow.
 	errChan := make(chan error, 1)
 	initReq := &openChanReq{
-		targetPubkey:    bob.privKey.PubKey(),
-		chainHash:       *activeNetParams.GenesisHash,
-		localFundingAmt: localAmt,
-		pushAmt:         lnwire.NewMSatFromSatoshis(pushAmt),
-		private:         false,
-		minHtlc:         minHtlc,
-		remoteCsvDelay:  csvDelay,
-		updates:         updateChan,
-		err:             errChan,
+		targetPubkey:     bob.privKey.PubKey(),
+		chainHash:        *activeNetParams.GenesisHash,
+		localFundingAmt:  localAmt,
+		pushAmt:          lnwire.NewMSatFromSatoshis(pushAmt),
+		private:          false,
+		maxValueInFlight: maxValueInFlight,
+		minHtlcIn:        minHtlcIn,
+		remoteCsvDelay:   csvDelay,
+		updates:          updateChan,
+		err:              errChan,
 	}
 
 	alice.fundingMgr.initFundingWorkflow(bob, initReq)
@@ -2378,9 +2466,15 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 	}
 
 	// Check that the custom minHTLC value is sent.
-	if openChannelReq.HtlcMinimum != minHtlc {
+	if openChannelReq.HtlcMinimum != minHtlcIn {
 		t.Fatalf("expected OpenChannel to have minHtlc %v, got %v",
-			minHtlc, openChannelReq.HtlcMinimum)
+			minHtlcIn, openChannelReq.HtlcMinimum)
+	}
+
+	// Check that the max value in flight is sent as part of OpenChannel.
+	if openChannelReq.MaxValueInFlight != maxValueInFlight {
+		t.Fatalf("expected OpenChannel to have MaxValueInFlight %v, got %v",
+			maxValueInFlight, openChannelReq.MaxValueInFlight)
 	}
 
 	chanID := openChannelReq.PendingChannelID
@@ -2403,6 +2497,14 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 	if acceptChannelResponse.HtlcMinimum != 5 {
 		t.Fatalf("expected AcceptChannel to have minHtlc %v, got %v",
 			5, acceptChannelResponse.HtlcMinimum)
+	}
+
+	reserve := lnwire.NewMSatFromSatoshis(fundingAmt / 100)
+	maxValueAcceptChannel := lnwire.NewMSatFromSatoshis(fundingAmt) - reserve
+
+	if acceptChannelResponse.MaxValueInFlight != maxValueAcceptChannel {
+		t.Fatalf("expected AcceptChannel to have MaxValueInFlight %v, got %v",
+			maxValueAcceptChannel, acceptChannelResponse.MaxValueInFlight)
 	}
 
 	// Forward the response to Alice.
@@ -2450,6 +2552,27 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 		return nil
 	}
 
+	// Helper method for checking the MaxValueInFlight stored for a
+	// reservation.
+	assertMaxHtlc := func(resCtx *reservationWithCtx,
+		expOurMaxValue, expTheirMaxValue lnwire.MilliSatoshi) error {
+
+		ourMaxValue :=
+			resCtx.reservation.OurContribution().MaxPendingAmount
+		if ourMaxValue != expOurMaxValue {
+			return fmt.Errorf("expected our maxValue to be %v, "+
+				"was %v", expOurMaxValue, ourMaxValue)
+		}
+
+		theirMaxValue :=
+			resCtx.reservation.TheirContribution().MaxPendingAmount
+		if theirMaxValue != expTheirMaxValue {
+			return fmt.Errorf("expected their MaxPendingAmount to be %v, "+
+				"was %v", expTheirMaxValue, theirMaxValue)
+		}
+		return nil
+	}
+
 	// Check that the custom channel parameters were properly set in the
 	// channel reservation.
 	resCtx, err := alice.fundingMgr.getReservationCtx(bobPubKey, chanID)
@@ -2457,7 +2580,7 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 		t.Fatalf("unable to find ctx: %v", err)
 	}
 
-	// Alice's CSV delay should be 4 since Bob sent the fedault value, and
+	// Alice's CSV delay should be 4 since Bob sent the default value, and
 	// Bob's should be 67 since Alice sent the custom value.
 	if err := assertDelay(resCtx, 4, csvDelay); err != nil {
 		t.Fatal(err)
@@ -2465,7 +2588,15 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 
 	// The minimum HTLC value Alice can offer should be 5, and the minimum
 	// Bob can offer should be 1234.
-	if err := assertMinHtlc(resCtx, 5, minHtlc); err != nil {
+	if err := assertMinHtlc(resCtx, 5, minHtlcIn); err != nil {
+		t.Fatal(err)
+	}
+
+	// The max value in flight Alice can have should be maxValueAcceptChannel,
+	// which is the default value and the maxium Bob can offer should be
+	// maxValueInFlight.
+	if err := assertMaxHtlc(resCtx,
+		maxValueAcceptChannel, maxValueInFlight); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2479,10 +2610,14 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := assertMinHtlc(resCtx, minHtlc, 5); err != nil {
+	if err := assertMinHtlc(resCtx, minHtlcIn, 5); err != nil {
 		t.Fatal(err)
 	}
 
+	if err := assertMaxHtlc(resCtx,
+		maxValueInFlight, maxValueAcceptChannel); err != nil {
+		t.Fatal(err)
+	}
 	// Give the message to Bob.
 	bob.fundingMgr.processFundingCreated(fundingCreated, alice)
 
@@ -2537,10 +2672,18 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 	).(*lnwire.FundingLocked)
 
 	// Make sure both fundingManagers send the expected channel
-	// announcements. Alice should advertise the default MinHTLC value of
+	// announcements.
+	// Alice should advertise the default MinHTLC value of
 	// 5, while bob should advertise the value minHtlc, since Alice
 	// required him to use it.
-	assertChannelAnnouncements(t, alice, bob, capacity, 5, minHtlc)
+	minHtlcArr := []lnwire.MilliSatoshi{5, minHtlcIn}
+
+	// For maxHltc Alice should advertise the default MaxHtlc value of
+	// maxValueAcceptChannel, while bob should advertise the value
+	// maxValueInFlight since Alice required him to use it.
+	maxHtlcArr := []lnwire.MilliSatoshi{maxValueAcceptChannel, maxValueInFlight}
+
+	assertChannelAnnouncements(t, alice, bob, capacity, minHtlcArr, maxHtlcArr)
 
 	// The funding transaction is now confirmed, wait for the
 	// OpenStatusUpdate_ChanOpen update
@@ -2551,8 +2694,6 @@ func TestFundingManagerCustomChannelParameters(t *testing.T) {
 // channel with the same peer when MaxPending channels are pending fails.
 func TestFundingManagerMaxPendingChannels(t *testing.T) {
 	t.Parallel()
-
-	const maxPending = 4
 
 	alice, bob := setupFundingManagers(
 		t, func(cfg *fundingConfig) {
@@ -2775,7 +2916,7 @@ func TestFundingManagerRejectPush(t *testing.T) {
 
 	// Assert Bob responded with an ErrNonZeroPushAmount error.
 	err := assertFundingMsgSent(t, bob.msgChan, "Error").(*lnwire.Error)
-	if !strings.Contains(err.Error(), "Non-zero push amounts are disabled") {
+	if !strings.Contains(err.Error(), "non-zero push amounts are disabled") {
 		t.Fatalf("expected ErrNonZeroPushAmount error, got \"%v\"",
 			err.Error())
 	}
@@ -2864,7 +3005,7 @@ func TestFundingManagerFundAll(t *testing.T) {
 			Value: btcutil.Amount(
 				0.05 * btcutil.SatoshiPerBitcoin,
 			),
-			PkScript: make([]byte, 22),
+			PkScript: coinPkScript,
 			OutPoint: wire.OutPoint{
 				Hash:  chainhash.Hash{},
 				Index: 0,
@@ -2875,7 +3016,7 @@ func TestFundingManagerFundAll(t *testing.T) {
 			Value: btcutil.Amount(
 				0.06 * btcutil.SatoshiPerBitcoin,
 			),
-			PkScript: make([]byte, 22),
+			PkScript: coinPkScript,
 			OutPoint: wire.OutPoint{
 				Hash:  chainhash.Hash{},
 				Index: 1,
@@ -2947,4 +3088,172 @@ func TestFundingManagerFundAll(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestGetUpfrontShutdown tests different combinations of inputs for getting a
+// shutdown script. It varies whether the peer has the feature set, whether
+// the user has provided a script and our local configuration to test that
+// GetUpfrontShutdownScript returns the expected outcome.
+func TestGetUpfrontShutdownScript(t *testing.T) {
+	upfrontScript := []byte("upfront script")
+	generatedScript := []byte("generated script")
+
+	getScript := func() (lnwire.DeliveryAddress, error) {
+		return generatedScript, nil
+	}
+
+	tests := []struct {
+		name           string
+		getScript      func() (lnwire.DeliveryAddress, error)
+		upfrontScript  lnwire.DeliveryAddress
+		peerEnabled    bool
+		localEnabled   bool
+		expectedScript lnwire.DeliveryAddress
+		expectedErr    error
+	}{
+		{
+			name:      "peer disabled, no shutdown",
+			getScript: getScript,
+		},
+		{
+			name:          "peer disabled, upfront provided",
+			upfrontScript: upfrontScript,
+			expectedErr:   errUpfrontShutdownScriptNotSupported,
+		},
+		{
+			name:           "peer enabled, upfront provided",
+			upfrontScript:  upfrontScript,
+			peerEnabled:    true,
+			expectedScript: upfrontScript,
+		},
+		{
+			name:        "peer enabled, local disabled",
+			peerEnabled: true,
+		},
+		{
+			name:           "local enabled, no upfront script",
+			getScript:      getScript,
+			peerEnabled:    true,
+			localEnabled:   true,
+			expectedScript: generatedScript,
+		},
+		{
+			name:           "local enabled, upfront script",
+			peerEnabled:    true,
+			upfrontScript:  upfrontScript,
+			localEnabled:   true,
+			expectedScript: upfrontScript,
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+
+		t.Run(test.name, func(t *testing.T) {
+			var mockPeer testNode
+
+			// If the remote peer in the test should support upfront shutdown,
+			// add the feature bit.
+			if test.peerEnabled {
+				mockPeer.remoteFeatures = []lnwire.FeatureBit{
+					lnwire.UpfrontShutdownScriptOptional,
+				}
+			}
+
+			addr, err := getUpfrontShutdownScript(
+				test.localEnabled, &mockPeer, test.upfrontScript,
+				test.getScript,
+			)
+			if err != test.expectedErr {
+				t.Fatalf("got: %v, expected error: %v", err, test.expectedErr)
+			}
+
+			if !bytes.Equal(addr, test.expectedScript) {
+				t.Fatalf("expected address: %x, got: %x",
+					test.expectedScript, addr)
+			}
+
+		})
+	}
+}
+
+func expectOpenChannelMsg(t *testing.T, msgChan chan lnwire.Message) *lnwire.OpenChannel {
+	var msg lnwire.Message
+	select {
+	case msg = <-msgChan:
+	case <-time.After(time.Second * 5):
+		t.Fatalf("node did not send OpenChannel message")
+	}
+
+	openChannelReq, ok := msg.(*lnwire.OpenChannel)
+	if !ok {
+		errorMsg, gotError := msg.(*lnwire.Error)
+		if gotError {
+			t.Fatalf("expected OpenChannel to be sent "+
+				"from bob, instead got error: %v",
+				errorMsg.Error())
+		}
+		t.Fatalf("expected OpenChannel to be sent, instead got %T",
+			msg)
+	}
+
+	return openChannelReq
+}
+
+// TestWumboChannelConfig tests that the funding manager will respect the wumbo
+// channel config param when creating or accepting new channels.
+func TestWumboChannelConfig(t *testing.T) {
+	t.Parallel()
+
+	// First we'll create a set of funding managers that will reject wumbo
+	// channels.
+	alice, bob := setupFundingManagers(t, func(cfg *fundingConfig) {
+		cfg.NoWumboChans = true
+	})
+
+	// If we attempt to initiate a new funding open request to Alice,
+	// that's below the wumbo channel mark, we should be able to start the
+	// funding process w/o issue.
+	updateChan := make(chan *lnrpc.OpenStatusUpdate)
+	errChan := make(chan error, 1)
+	initReq := &openChanReq{
+		targetPubkey:    bob.privKey.PubKey(),
+		chainHash:       *activeNetParams.GenesisHash,
+		localFundingAmt: MaxFundingAmount,
+		pushAmt:         lnwire.NewMSatFromSatoshis(0),
+		private:         false,
+		updates:         updateChan,
+		err:             errChan,
+	}
+
+	// We expect Bob to respond with an Accept channel message.
+	alice.fundingMgr.initFundingWorkflow(bob, initReq)
+	openChanMsg := expectOpenChannelMsg(t, alice.msgChan)
+	bob.fundingMgr.processFundingOpen(openChanMsg, alice)
+	assertFundingMsgSent(t, bob.msgChan, "AcceptChannel")
+
+	// We'll now attempt to create a channel above the wumbo mark, which
+	// should be rejected.
+	initReq.localFundingAmt = btcutil.SatoshiPerBitcoin
+
+	// After processing the funding open message, bob should respond with
+	// an error rejecting the channel.
+	alice.fundingMgr.initFundingWorkflow(bob, initReq)
+	openChanMsg = expectOpenChannelMsg(t, alice.msgChan)
+	bob.fundingMgr.processFundingOpen(openChanMsg, alice)
+	assertErrorSent(t, bob.msgChan)
+
+	// Next, we'll re-create the funding managers, but this time allowing
+	// wumbo channels explicitly.
+	tearDownFundingManagers(t, alice, bob)
+	alice, bob = setupFundingManagers(t, func(cfg *fundingConfig) {
+		cfg.NoWumboChans = false
+	})
+
+	// We should now be able to initiate a wumbo channel funding w/o any
+	// issues.
+	alice.fundingMgr.initFundingWorkflow(bob, initReq)
+	openChanMsg = expectOpenChannelMsg(t, alice.msgChan)
+	bob.fundingMgr.processFundingOpen(openChanMsg, alice)
+	assertFundingMsgSent(t, bob.msgChan, "AcceptChannel")
 }

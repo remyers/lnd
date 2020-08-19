@@ -9,7 +9,6 @@ import (
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/wire"
-	"github.com/lightningnetwork/lnd/tlv"
 )
 
 // HopData is the information destined for individual hops. It is a fixed size
@@ -212,7 +211,7 @@ func (hp *HopPayload) Encode(w io.Writer) error {
 	// as a var-int.
 	case PayloadTLV:
 		var b [8]byte
-		err := tlv.WriteVarInt(w, uint64(len(hp.Payload)), &b)
+		err := WriteVarInt(w, uint64(len(hp.Payload)), &b)
 		if err != nil {
 			return err
 		}
@@ -250,14 +249,14 @@ func (hp *HopPayload) Decode(r io.Reader) error {
 	case 0x00:
 		// Our size is just the payload, without the HMAC. This means
 		// that this is the legacy payload type.
-		payloadSize = HopDataSize - HMACSize
+		payloadSize = LegacyHopDataSize - HMACSize
 		hp.Type = PayloadLegacy
 
 	default:
 		// Otherwise, this is the new TLV based payload type, so we'll
 		// extract the payload length encoded as a var-int.
 		var b [8]byte
-		varInt, err := tlv.ReadVarInt(bufReader, &b)
+		varInt, err := ReadVarInt(bufReader, &b)
 		if err != nil {
 			return err
 		}
@@ -305,11 +304,15 @@ func (hp *HopPayload) HopData() (*HopData, error) {
 	return &hd, nil
 }
 
-// NumMaxHops is the maximum path length. This should be set to an estimate of
-// the upper limit of the diameter of the node graph.
-//
-// TODO(roasbeef): adjust due to var-payloads?
-const NumMaxHops = 20
+// NumMaxHops is the maximum path length. There is a maximum of 1300 bytes in
+// the routing info block. Legacy hop payloads are always 65 bytes, while tlv
+// payloads are at least 47 bytes (tlvlen 1, amt 2, timelock 2, nextchan 10,
+// hmac 32) for the intermediate hops and 37 bytes (tlvlen 1, amt 2, timelock 2,
+// hmac 32) for the exit hop. The maximum path length can therefore only be
+// reached by using tlv payloads only. With that, the maximum number of
+// intermediate hops is: Floor((1300 - 37) / 47) = 26. Including the exit hop,
+// the maximum path length is 27 hops.
+const NumMaxHops = 27
 
 // PaymentPath represents a series of hops within the Lightning Network
 // starting at a sender and terminating at a receiver. Each hop contains a set

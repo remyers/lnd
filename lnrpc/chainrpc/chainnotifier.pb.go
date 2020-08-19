@@ -8,6 +8,8 @@ import (
 	fmt "fmt"
 	proto "github.com/golang/protobuf/proto"
 	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
 	math "math"
 )
 
@@ -106,7 +108,8 @@ type ConfDetails struct {
 	RawTx []byte `protobuf:"bytes,1,opt,name=raw_tx,json=rawTx,proto3" json:"raw_tx,omitempty"`
 	// The hash of the block in which the confirmed transaction was included in.
 	BlockHash []byte `protobuf:"bytes,2,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"`
-	// The height of the block in which the confirmed transaction was included in.
+	// The height of the block in which the confirmed transaction was included
+	// in.
 	BlockHeight uint32 `protobuf:"varint,3,opt,name=block_height,json=blockHeight,proto3" json:"block_height,omitempty"`
 	// The index of the confirmed transaction within the transaction.
 	TxIndex              uint32   `protobuf:"varint,4,opt,name=tx_index,json=txIndex,proto3" json:"tx_index,omitempty"`
@@ -830,6 +833,20 @@ type ChainNotifierServer interface {
 	//point. This allows clients to be idempotent by ensuring that they do not
 	//missing processing a single block within the chain.
 	RegisterBlockEpochNtfn(*BlockEpoch, ChainNotifier_RegisterBlockEpochNtfnServer) error
+}
+
+// UnimplementedChainNotifierServer can be embedded to have forward compatible implementations.
+type UnimplementedChainNotifierServer struct {
+}
+
+func (*UnimplementedChainNotifierServer) RegisterConfirmationsNtfn(req *ConfRequest, srv ChainNotifier_RegisterConfirmationsNtfnServer) error {
+	return status.Errorf(codes.Unimplemented, "method RegisterConfirmationsNtfn not implemented")
+}
+func (*UnimplementedChainNotifierServer) RegisterSpendNtfn(req *SpendRequest, srv ChainNotifier_RegisterSpendNtfnServer) error {
+	return status.Errorf(codes.Unimplemented, "method RegisterSpendNtfn not implemented")
+}
+func (*UnimplementedChainNotifierServer) RegisterBlockEpochNtfn(req *BlockEpoch, srv ChainNotifier_RegisterBlockEpochNtfnServer) error {
+	return status.Errorf(codes.Unimplemented, "method RegisterBlockEpochNtfn not implemented")
 }
 
 func RegisterChainNotifierServer(s *grpc.Server, srv ChainNotifierServer) {

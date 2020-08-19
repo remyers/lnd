@@ -2,9 +2,9 @@ package sphinx
 
 import (
 	"bytes"
-	"crypto/ecdsa"
 	"crypto/hmac"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"math/big"
 
@@ -36,29 +36,26 @@ const (
 	// utilize this space to pack in the unrolled bytes.
 	NumPaddingBytes = 12
 
-	// HopDataSize is the fixed size of hop_data. BOLT 04 currently
+	// LegacyHopDataSize is the fixed size of hop_data. BOLT 04 currently
 	// specifies this to be 1 byte realm, 8 byte channel_id, 8 byte amount
-	// to forward, 4 byte outgoing CLTV value, 12 bytes padding and 32
-	// bytes HMAC for a total of 65 bytes per hop.
-	HopDataSize = (RealmByteSize + AddressSize + AmtForwardSize +
+	// to forward, 4 byte outgoing CLTV value, 12 bytes padding and 32 bytes
+	// HMAC for a total of 65 bytes per hop.
+	LegacyHopDataSize = (RealmByteSize + AddressSize + AmtForwardSize +
 		OutgoingCLTVSize + NumPaddingBytes + HMACSize)
 
-	// MaxPayloadSize is the maximum size a payload for a single hop can
-	// be. This is the worst case scenario of a single hop, consuming all
-	// 20 frames. We need to know this in order to generate a sufficiently
-	// long stream of pseudo-random bytes when encrypting/decrypting the
-	// payload.
-	MaxPayloadSize = NumMaxHops * HopDataSize
-
-	// sharedSecretSize is the size in bytes of the shared secrets.
-	sharedSecretSize = 32
+	// MaxPayloadSize is the maximum size a payload for a single hop can be.
+	// This is the worst case scenario of a single hop, consuming all
+	// available space. We need to know this in order to generate a
+	// sufficiently long stream of pseudo-random bytes when
+	// encrypting/decrypting the payload.
+	MaxPayloadSize = routingInfoSize
 
 	// routingInfoSize is the fixed size of the the routing info. This
 	// consists of a addressSize byte address and a HMACSize byte HMAC for
 	// each hop of the route, the first pair in cleartext and the following
-	// pairs increasingly obfuscated. In case fewer than numMaxHops are
-	// used, then the remainder is padded with null-bytes, also obfuscated.
-	routingInfoSize = NumMaxHops * HopDataSize
+	// pairs increasingly obfuscated. If not all space is used up, the
+	// remainder is padded with null-bytes, also obfuscated.
+	routingInfoSize = 1300
 
 	// numStreamBytes is the number of bytes produced by our CSPRG for the
 	// key stream implementing our stream cipher to encrypt/decrypt the mix
@@ -74,6 +71,11 @@ const (
 
 	// baseVersion represent the current supported version of onion packet.
 	baseVersion = 0
+)
+
+var (
+	ErrMaxRoutingInfoSizeExceeded = fmt.Errorf(
+		"max routing info size of %v bytes exceeded", routingInfoSize)
 )
 
 // OnionPacket is the onion wrapped hop-to-hop routing information necessary to
@@ -114,7 +116,7 @@ type OnionPacket struct {
 // generateSharedSecrets by the given nodes pubkeys, generates the shared
 // secrets.
 func generateSharedSecrets(paymentPath []*btcec.PublicKey,
-	sessionKey *btcec.PrivateKey) []Hash256 {
+	sessionKey *btcec.PrivateKey) ([]Hash256, error) {
 
 	// Each hop performs ECDH with our ephemeral key pair to arrive at a
 	// shared secret. Additionally, each hop randomizes the group element
@@ -128,8 +130,15 @@ func generateSharedSecrets(paymentPath []*btcec.PublicKey,
 	// Within the loop each new triplet will be computed recursively based
 	// off of the blinding factor of the last hop.
 	lastEphemeralPubKey := sessionKey.PubKey()
-	hopSharedSecrets[0] = generateSharedSecret(paymentPath[0], sessionKey)
-	lastBlindingFactor := computeBlindingFactor(lastEphemeralPubKey, hopSharedSecrets[0][:])
+	sessionKeyECDH := &PrivKeyECDH{PrivKey: sessionKey}
+	sharedSecret, err := sessionKeyECDH.ECDH(paymentPath[0])
+	if err != nil {
+		return nil, err
+	}
+	hopSharedSecrets[0] = sharedSecret
+	lastBlindingFactor := computeBlindingFactor(
+		lastEphemeralPubKey, hopSharedSecrets[0][:],
+	)
 
 	// The cached blinding factor will contain the running product of the
 	// session private key x and blinding factors b_i, computed as
@@ -181,19 +190,39 @@ func generateSharedSecrets(paymentPath []*btcec.PublicKey,
 		)
 	}
 
-	return hopSharedSecrets
+	return hopSharedSecrets, nil
 }
 
 // NewOnionPacket creates a new onion packet which is capable of obliviously
 // routing a message through the mix-net path outline by 'paymentPath'.
 func NewOnionPacket(paymentPath *PaymentPath, sessionKey *btcec.PrivateKey,
-	assocData []byte) (*OnionPacket, error) {
+	assocData []byte, pktFiller PacketFiller) (*OnionPacket, error) {
 
+	// Check whether total payload size doesn't exceed the hard maximum.
+	if paymentPath.TotalPayloadSize() > routingInfoSize {
+		return nil, ErrMaxRoutingInfoSizeExceeded
+	}
+
+	// If we don't actually have a partially populated route, then we'll
+	// exit early.
 	numHops := paymentPath.TrueRouteLength()
+	if numHops == 0 {
+		return nil, fmt.Errorf("route of length zero passed in")
+	}
 
-	hopSharedSecrets := generateSharedSecrets(
+	// We'll force the caller to provide a packet filler, as otherwise we
+	// may default to an insecure filling method (which should only really
+	// be used to generate test vectors).
+	if pktFiller == nil {
+		return nil, fmt.Errorf("packet filler must be specified")
+	}
+
+	hopSharedSecrets, err := generateSharedSecrets(
 		paymentPath.NodeKeys(), sessionKey,
 	)
+	if err != nil {
+		return nil, fmt.Errorf("error generating shared secret: %v", err)
+	}
 
 	// Generate the padding, called "filler strings" in the paper.
 	filler := generateHeaderPadding("rho", paymentPath, hopSharedSecrets)
@@ -205,6 +234,11 @@ func NewOnionPacket(paymentPath *PaymentPath, sessionKey *btcec.PrivateKey,
 		nextHmac      [HMACSize]byte
 		hopPayloadBuf bytes.Buffer
 	)
+
+	// Fill the packet using the caller specified methodology.
+	if err := pktFiller(sessionKey, &mixHeader); err != nil {
+		return nil, err
+	}
 
 	// Now we compute the routing information for each hop, along with a
 	// MAC of the routing info using the shared key for that hop.
@@ -224,7 +258,6 @@ func NewOnionPacket(paymentPath *PaymentPath, sessionKey *btcec.PrivateKey,
 		// generate enough bytes to obfuscate this layer of the onion
 		// packet.
 		streamBytes := generateCipherStream(rhoKey, routingInfoSize)
-
 		payload := paymentPath[i].HopPayload
 
 		// Before we assemble the packet, we'll shift the current
@@ -455,14 +488,14 @@ type Router struct {
 	nodeID   [AddressSize]byte
 	nodeAddr *btcutil.AddressPubKeyHash
 
-	onionKey *btcec.PrivateKey
+	onionKey SingleKeyECDH
 
 	log ReplayLog
 }
 
 // NewRouter creates a new instance of a Sphinx onion Router given the node's
 // currently advertised onion private key, and the target Bitcoin network.
-func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params, log ReplayLog) *Router {
+func NewRouter(nodeKey SingleKeyECDH, net *chaincfg.Params, log ReplayLog) *Router {
 	var nodeID [AddressSize]byte
 	copy(nodeID[:], btcutil.Hash160(nodeKey.PubKey().SerializeCompressed()))
 
@@ -472,15 +505,8 @@ func NewRouter(nodeKey *btcec.PrivateKey, net *chaincfg.Params, log ReplayLog) *
 	return &Router{
 		nodeID:   nodeID,
 		nodeAddr: nodeAddr,
-		onionKey: &btcec.PrivateKey{
-			PublicKey: ecdsa.PublicKey{
-				Curve: btcec.S256(),
-				X:     nodeKey.X,
-				Y:     nodeKey.Y,
-			},
-			D: nodeKey.D,
-		},
-		log: log,
+		onionKey: nodeKey,
+		log:      log,
 	}
 }
 

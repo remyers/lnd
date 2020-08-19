@@ -40,9 +40,6 @@ type Config struct {
 	// that's backed by the identity private key of the running lnd node.
 	NodeSigner *netann.NodeSigner
 
-	// MaxPaymentMSat is the maximum allowed payment.
-	MaxPaymentMSat lnwire.MilliSatoshi
-
 	// DefaultCLTVExpiry is the default invoice expiry if no values is
 	// specified.
 	DefaultCLTVExpiry uint32
@@ -50,4 +47,8 @@ type Config struct {
 	// ChanDB is a global boltdb instance which is needed to access the
 	// channel graph.
 	ChanDB *channeldb.DB
+
+	// GenInvoiceFeatures returns a feature containing feature bits that
+	// should be advertised on freshly generated invoices.
+	GenInvoiceFeatures func() *lnwire.FeatureVector
 }

@@ -12,7 +12,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec"
 	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/lightningnetwork/lnd/sphinx"
+	sphinx "github.com/lightningnetwork/lightning-onion"
 )
 
 type OnionHopSpec struct {
@@ -105,7 +105,10 @@ func main() {
 			log.Fatalf("could not parse onion spec: %v", err)
 		}
 
-		msg, err := sphinx.NewOnionPacket(path, sessionKey, assocData)
+		msg, err := sphinx.NewOnionPacket(
+			path, sessionKey, assocData,
+			sphinx.DeterministicPacketFiller,
+		)
 		if err != nil {
 			log.Fatalf("Error creating message: %v", err)
 		}
@@ -130,8 +133,11 @@ func main() {
 		}
 
 		privkey, _ := btcec.PrivKeyFromBytes(btcec.S256(), binKey)
+		privKeyECDH := &sphinx.PrivKeyECDH{PrivKey: privkey}
 		replayLog := sphinx.NewMemoryReplayLog()
-		s := sphinx.NewRouter(privkey, &chaincfg.TestNet3Params, replayLog)
+		s := sphinx.NewRouter(
+			privKeyECDH, &chaincfg.TestNet3Params, replayLog,
+		)
 
 		replayLog.Start()
 		defer replayLog.Stop()

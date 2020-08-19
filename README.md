@@ -58,7 +58,7 @@ resources including talks, articles, and example applications can be found at:
 [dev.lightning.community](https://dev.lightning.community).
 
 Finally, we also have an active
-[Slack](https://join.slack.com/t/lightningcommunity/shared_invite/enQtMzQ0OTQyNjE5NjU1LThmOGJkZDIzY2U2ODI5ODhmOWMzM2FkOTY5ZTdkYTc5NDYyN2U1YTJkZTE1MWU2OTZlZTAyOWY4NGY2M2M1NTM) where protocol developers, application developers, testers and users gather to
+[Slack](https://lightning.engineering/slack.html) where protocol developers, application developers, testers and users gather to
 discuss various aspects of `lnd` and also Lightning in general.
 
 ## Installation
@@ -67,11 +67,18 @@ discuss various aspects of `lnd` and also Lightning in general.
 
 ## Docker
   To run lnd from Docker, please see the main [Docker instructions](docs/DOCKER.md)
-  
+
 ## IRC
   * irc.freenode.net
   * channel #lnd
   * [webchat](https://webchat.freenode.net/?channels=lnd)
+
+## Safety
+
+When operating a mainnet `lnd` node, please refer to our [operational safety
+guildelines](docs/safety.md). It is important to note that `lnd` is still
+**beta** software and that ignoring these operational guidelines can lead to
+loss of funds.
 
 ## Security
 
