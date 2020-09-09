@@ -411,7 +411,7 @@ func NewBrontideMachine(initiator bool, localKey keychain.SingleKeyECDH,
 		option(m)
 	}
 
-	m.enableEncryption = false
+	m.enableEncryption = true
 
 	return m
 }
