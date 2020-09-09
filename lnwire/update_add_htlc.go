@@ -8,7 +8,7 @@ import (
 // in each UpdateAddHTLC message. The breakdown of the onion packet is as
 // follows: 1-byte version, 33-byte ephemeral public key (for ECDH), 1300-bytes
 // of per-hop data, and a 32-byte HMAC over the entire packet.
-const OnionPacketSize = 1366
+const OnionPacketSize = 1 + 33 + 1300 + 32
 
 // UpdateAddHTLC is the message sent by Alice to Bob when she wishes to add an
 // HTLC to his remote commitment transaction. In addition to information
@@ -107,7 +107,7 @@ func (c *UpdateAddHTLC) MsgType() MessageType {
 // This is part of the lnwire.Message interface.
 func (c *UpdateAddHTLC) MaxPayloadLength(uint32) uint32 {
 	// 1450
-	return 32 + 8 + 4 + 8 + 32 + 1366
+	return 32 + 8 + 4 + 8 + 32 + OnionPacketSize
 }
 
 // TargetChanID returns the channel id of the link for which this message is
