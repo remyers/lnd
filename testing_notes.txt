@@ -1,0 +1,107 @@
+# originally from https://medium.com/@bitstein/setting-up-a-bitcoin-lightning-network-test-environment
+
+# Add to ~/.bash_profile:
+
+# Regtest
+export REGTESTD_DIR="$HOME/app-container/.bitcoin"
+alias regtestd="bitcoind -datadir=$REGTESTD_DIR"
+alias regtest-cli="bitcoin-cli -datadir=$REGTESTD_DIR"
+
+# LND
+export LND1_DIR="~/app-container/.lnd"
+export LND2_DIR="~/app-container/.lnd2"
+export LND3_DIR="~/app-container/.lnd3"
+alias lnd1="lnd --lnddir=$LND1_DIR";
+alias lncli1="lncli -n regtest --lnddir=$LND1_DIR"
+alias lnd2="lnd --lnddir=$LND2_DIR";
+alias lncli2="lncli -n regtest --lnddir=$LND2_DIR --rpcserver=localhost:11009"
+alias lnd3="lnd --lnddir=$LND3_DIR";
+alias lncli3="lncli -n regtest --lnddir=$LND3_DIR --rpcserver=localhost:11010"
+
+# start regtest bitcoind daemon
+regtestd
+
+# create some blocks and reward coin
+regtest-cli generate 101
+
+# launch lnd1 and lnd2
+lnd1 & (or use 'daemon 1 (lnd)' VSCode debug script)
+lnd2 & (or use 'daemon 2 (lnd)' VSCode debug script)
+lnd3 & (or use 'daemon 3 (lnd)' VSCode debug script)
+
+# create... 
+lncli1 create
+lncli2 create
+lncli3 create
+
+# OR unlock wallet
+lncli1 unlock
+lncli2 unlock
+lncli3 unlock
+
+# get pubkeys of lnd1 and lnd2
+export pk1=`lncli1 getinfo | jq -r '.identity_pubkey'`
+export pk2=`lncli2 getinfo | jq -r '.identity_pubkey'`
+export pk3=`lncli3 getinfo | jq -r '.identity_pubkey'`
+
+# connect lnd1 to lnd2
+lncli1 connect $pk2@localhost:9734
+lncli1 listpeers
+
+# connect lnd2 to lnd3
+lncli2 connect $pk3@localhost:9733
+lncli2 listpeers
+
+# add funds to lnd2
+regtest-cli sendtoaddress `lncli2 newaddress np2wkh | jq -r '.address'` 1
+regtest-cli generate 1
+lncli2 walletbalance
+
+# add funds to lnd3
+regtest-cli sendtoaddress `lncli3 newaddress np2wkh | jq -r '.address'` 1
+regtest-cli generate 1
+lncli3 walletbalance
+
+# create channel from lnd2 to lnd1
+lncli2 openchannel $pk1 100000
+regtest-cli generate 6
+lncli1 listchannels
+
+# create channel from lnd3 to lnd2
+lncli3 openchannel $pk2 100000
+regtest-cli generate 6
+lncli2 listchannels
+
+# send payment from lnd2 to lnd1
+export payment_request=`lncli1 addinvoice -amt 100 | jq -r '.payment_request'`
+export payment_hash=`lncli1 decodepayreq $payment_request | jq -r '.payment_hash'`
+lncli2 payinvoice $payment_request
+
+# confirm invoice is settled
+lncli1 lookupinvoice $payment_hash | grep "settled"
+
+# send payment from ln1 to ln3 via ln2 via an explicit route (not gossip)
+export payment_request=`lncli3 addinvoice -amt 100 | jq -r '.payment_request'`
+export payment_hash=`lncli3 decodepayreq $payment_request | jq -r '.payment_hash'`
+lncli1 buildroute --amt 100 --hops $pk2,$pk3 | lncli1 sendtoroute -pay_hash=$payment_hash -
+
+# after using sendtoroute then node 1 knows route to node 3, so we can use sendpayment 
+# to attach a message
+# Note: Whatsat uses key=34349334 to send variable length message
+# TODO: why doesn't this work, lncli1 sendpayment --amt 100 --dest $pk3 --amt 100 --keysend --data 34349334=<message hash>
+
+lncli1 sendpayment --amt 100 --dest=$pk3 --amt 100 --payment_hash $payment_hash --data 34349334=ffffffffff
+
+# if connecting node 1 to node 2 through mesh socket proxy on phone at IP address 192.168.86.168:8888
+lncli1 connect $pk2@192.168.86.168:8888
+
+# shutdown everything
+regtest-cli stop
+lncli1 stop
+lncli2 stop
+
+
+
+
+
+
