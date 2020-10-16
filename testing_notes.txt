@@ -91,9 +91,13 @@ lncli1 buildroute --amt 100 --hops $pk2,$pk3 | lncli1 sendtoroute -pay_hash=$pay
 # Note: Whatsat uses key=34349334 to send variable length message
 # QUESTION: why doesn't this work, lncli1 sendpayment --amt 100 --dest $pk3 --amt 100 --keysend --data 34349334=<message hash>
 # ANSWER: because channels are private and not added to LNDs routing group; see Issue https://github.com/lightningnetwork/lnd/issues/4265
+#
+# lncli1 sendpayment --amt 100 --dest=$pk3 --payment_hash $payment_hash --data 34349334=<hex encoded UTF-8>
 
-lncli1 sendpayment --amt 100 --dest=$pk3 --payment_hash $payment_hash --data 34349334=ffffffffff
-lncli1 sendpayment --dest=03c6795e0241daabfdf016a5ecdf8eecdc4f728d57910cfdfe3baad29d145ab369 --amt=9 --final_cltv_delta=40 --keysend
+lncli1 sendpayment --dest=03e0b0e07a7fa784595296d804e3e305d2872a42772ca7c2bb5277a87529816087 --amt=1 --final_cltv_delta=40 --keysend --data 34349334=776174736f6e2c20636f6d6520686572650a
+
+# to add a message include whatsat msg tlv and hex version of text
+--data 34349334=776174736f6e2c20636f6d6520686572650a
 
 # if connecting node 1 to node 2 through mesh socket proxy on phone at IP address 192.168.86.168:8888
 lncli1 connect $pk2@192.168.86.168:8888
