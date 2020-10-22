@@ -57,7 +57,7 @@ done
 
 # If prefix=1 is specified, prefix the generated methods with subserver name.
 # This must be enabled to support subservers with name conflicts.
-use_prefix="0"
+use_prefix="1"
 if [ "$prefix" = "1" ]
 then
     echo "Prefixing methods with subserver name"
