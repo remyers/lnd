@@ -274,14 +274,23 @@ out:
 							msg.EndHeight, err)
 						return
 					}
-
-					chainntnfs.Log.Infof("Historical "+
-						"spend dispatch finished "+
-						"for request %v (start=%v "+
-						"end=%v) with details: %v",
-						msg.SpendRequest,
-						msg.StartHeight, msg.EndHeight,
-						spendDetails)
+					if spendDetails == nil {
+						chainntnfs.Log.Infof("Rescan to "+
+							"determine the spend "+
+							"details of %v within "+
+							"range %d-%d did not find "+
+							"spend details.",
+							msg.SpendRequest, msg.StartHeight, 
+							msg.EndHeight)
+					} else {
+						chainntnfs.Log.Infof("Historical "+
+							"spend dispatch finished "+
+							"for request %v (start=%v "+
+							"end=%v) with details: %v",
+							msg.SpendRequest,
+							msg.StartHeight, msg.EndHeight,
+							spendDetails)
+					}
 
 					// If the historical dispatch finished
 					// without error, we will invoke
@@ -805,7 +814,7 @@ func (b *BitcoindNotifier) historicalSpendDetails(
 		}
 	}
 
-	return nil, errors.New("not found")
+	return nil, nil
 }
 
 // RegisterConfirmationsNtfn registers an intent to be notified once the target
