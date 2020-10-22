@@ -1,0 +1,14 @@
+
+Make debug files:
+* make
+
+Make RPC proto files without name conflicts
+* modify prefix https://github.com/lightningnetwork/lnd/blob/master/mobile/gen_bindings.sh#L60 from "0" to "1"
+* make rpc
+
+
+To create Lndmobile.aar copy to lndmobile.aar in Android project:
+* export ANDROID_NDK_HOME=/Volumes/Personal/Library/Android/sdk/ndk/21.3.6528147/
+* export ANDROID_HOME=/Volumes/Personal/Library/Android/sdk
+* make android tags="routerrpc"
+* cp $GOPATH/src/github.com/lightningnetwork/lnd/mobile/build/android/Lndmobile.aar ~/VSCode/rust-for-android-ios-flutter/android/lndmobile/lndmobile.aar

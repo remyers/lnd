@@ -805,7 +805,7 @@ func (b *BitcoindNotifier) historicalSpendDetails(
 		}
 	}
 
-	return nil, nil
+	return nil, errors.New("not found")
 }
 
 // RegisterConfirmationsNtfn registers an intent to be notified once the target

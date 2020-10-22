@@ -700,6 +700,8 @@ func findPath(g *graphParams, r *RestrictParams, cfg *PathFindingConfig,
 
 		// Skip paths that would exceed the maximum routing info size.
 		if routingInfoSize > sphinx.MaxPayloadSize {
+			log.Warnf("routingInfoSize %v > sphinx.MaxPayloadSize %v",
+				routingInfoSize, sphinx.MaxPayloadSize)
 			return
 		}
 

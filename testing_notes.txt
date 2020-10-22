@@ -8,15 +8,16 @@ alias regtestd="bitcoind -datadir=$REGTESTD_DIR"
 alias regtest-cli="bitcoin-cli -datadir=$REGTESTD_DIR"
 
 # LND
+export PATH=~/VSCode/go/lnd:$PATH
 export LND1_DIR="~/app-container/.lnd"
 export LND2_DIR="~/app-container/.lnd2"
 export LND3_DIR="~/app-container/.lnd3"
-alias lnd1="lnd --lnddir=$LND1_DIR";
-alias lncli1="lncli -n regtest --lnddir=$LND1_DIR"
-alias lnd2="lnd --lnddir=$LND2_DIR";
-alias lncli2="lncli -n regtest --lnddir=$LND2_DIR --rpcserver=localhost:11009"
-alias lnd3="lnd --lnddir=$LND3_DIR";
-alias lncli3="lncli -n regtest --lnddir=$LND3_DIR --rpcserver=localhost:11010"
+alias lnd1="lnd-debug --lnddir=$LND1_DIR";
+alias lncli1="lncli-debug -n regtest --lnddir=$LND1_DIR"
+alias lnd2="lnd-debug --lnddir=$LND2_DIR";
+alias lncli2="lncli-debug -n regtest --lnddir=$LND2_DIR --rpcserver=localhost:11009"
+alias lnd3="lnd-debug --lnddir=$LND3_DIR";
+alias lncli3="lncli-debug -n regtest --lnddir=$LND3_DIR --rpcserver=localhost:11010"
 
 # start regtest bitcoind daemon
 regtestd
@@ -88,9 +89,15 @@ lncli1 buildroute --amt 100 --hops $pk2,$pk3 | lncli1 sendtoroute -pay_hash=$pay
 # after using sendtoroute then node 1 knows route to node 3, so we can use sendpayment 
 # to attach a message
 # Note: Whatsat uses key=34349334 to send variable length message
-# TODO: why doesn't this work, lncli1 sendpayment --amt 100 --dest $pk3 --amt 100 --keysend --data 34349334=<message hash>
+# QUESTION: why doesn't this work, lncli1 sendpayment --amt 100 --dest $pk3 --amt 100 --keysend --data 34349334=<message hash>
+# ANSWER: because channels are private and not added to LNDs routing group; see Issue https://github.com/lightningnetwork/lnd/issues/4265
+#
+# lncli1 sendpayment --amt 100 --dest=$pk3 --payment_hash $payment_hash --data 34349334=<hex encoded UTF-8>
 
-lncli1 sendpayment --amt 100 --dest=$pk3 --amt 100 --payment_hash $payment_hash --data 34349334=ffffffffff
+lncli1 sendpayment --dest=03e0b0e07a7fa784595296d804e3e305d2872a42772ca7c2bb5277a87529816087 --amt=100 --final_cltv_delta=40 --keysend --data 34349334=776174736f6e2c20636f6d6520686572650a
+
+# to add a message include whatsat msg tlv and hex version of text
+--data 34349334=776174736f6e2c20636f6d6520686572650a
 
 # if connecting node 1 to node 2 through mesh socket proxy on phone at IP address 192.168.86.168:8888
 lncli1 connect $pk2@192.168.86.168:8888
