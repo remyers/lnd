@@ -66,3 +66,15 @@ profile.tmp
 
 # Coverage test
 coverage.txt
+lnrpc/wtclientrpc/Wtclient.java
+lnrpc/autopilotrpc/AutopilotOuterClass.java
+lnrpc/chainrpc/Chainnotifier.java
+lnrpc/invoicesrpc/InvoicesOuterClass.java
+lnrpc/lnclipb/Lncli.java
+lnrpc/lnrpc/Rpc.java
+lnrpc/lnrpc/Walletunlocker.java
+lnrpc/routerrpc/RouterOuterClass.java
+lnrpc/signrpc/SignerOuterClass.java
+lnrpc/verrpc/Verrpc.java
+lnrpc/walletrpc/Walletkit.java
+lnrpc/watchtowerrpc/WatchtowerOuterClass.java
