@@ -94,7 +94,7 @@ lncli1 buildroute --amt 100 --hops $pk2,$pk3 | lncli1 sendtoroute -pay_hash=$pay
 #
 # lncli1 sendpayment --amt 100 --dest=$pk3 --payment_hash $payment_hash --data 34349334=<hex encoded UTF-8>
 
-lncli1 sendpayment --dest=03e0b0e07a7fa784595296d804e3e305d2872a42772ca7c2bb5277a87529816087 --amt=1 --final_cltv_delta=40 --keysend --data 34349334=776174736f6e2c20636f6d6520686572650a
+lncli1 sendpayment --dest=03e0b0e07a7fa784595296d804e3e305d2872a42772ca7c2bb5277a87529816087 --amt=100 --final_cltv_delta=40 --keysend --data 34349334=776174736f6e2c20636f6d6520686572650a
 
 # to add a message include whatsat msg tlv and hex version of text
 --data 34349334=776174736f6e2c20636f6d6520686572650a
